@@ -3,235 +3,214 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta, time
 
-st.set_page_config(layout="wide", page_title="Acompanhamento de Equipe Call Center")
+st.set_page_config(layout="wide", page_title="Dashboard de Escala e Status de Agentes")
 
-st.title("📊 Acompanhamento de Equipe de Call Center")
+st.title("📊 Dashboard de Escala e Status de Agentes")
 
-# --- Função para processar status que atravessam a meia-noite ---
+# --- Função para dividir status que atravessam a meia-noite ---
 def split_status_across_days(df):
-    processed_data = []
-    for index, row in df.iterrows():
-        start_time = row['Start Time']
-        end_time = row['End Time']
+    """
+    Divide entradas de status que atravessam a meia-noite em múltiplas entradas,
+    uma para cada dia.
+    """
+    new_rows = []
+    for _, row in df.iterrows():
+        start = row['Inicio']
+        end = row['Fim']
 
-        # Certifica-se de que as colunas são datetime
-        if not pd.api.types.is_datetime64_any_dtype(start_time):
-            start_time = pd.to_datetime(start_time)
-        if not pd.api.types.is_datetime64_any_dtype(end_time):
-            end_time = pd.to_datetime(end_time)
+        # Se o fim for NaN, significa que o status ainda está ativo.
+        # Para fins de visualização, podemos assumir que termina no final do dia atual
+        # ou no momento atual se for o dia de hoje.
+        if pd.isna(end):
+            # Para simplificar, vamos assumir que um status sem fim termina no final do dia.
+            # Você pode ajustar essa lógica conforme a necessidade (ex: terminar no datetime.now())
+            end = datetime.combine(start.date(), time(23, 59, 59))
+            if end < start: # Se o status começou e terminou no mesmo dia, mas o fim foi ajustado para 23:59:59
+                end = datetime.combine(start.date() + timedelta(days=1), time(23, 59, 59))
 
-        current_start = start_time
-        while current_start.date() < end_time.date():
-            # O status termina no final do dia atual
-            end_of_day = datetime.combine(current_start.date(), time(23, 59, 59))
-            processed_data.append({
+        current_day = start.date()
+        while current_day <= end.date():
+            day_end = datetime.combine(current_day, time(23, 59, 59))
+
+            # O status termina no dia atual ou continua para o próximo?
+            segment_end = min(end, day_end)
+
+            new_rows.append({
                 'Agente': row['Agente'],
                 'Status': row['Status'],
-                'Start Time': current_start,
-                'End Time': end_of_day,
-                'Tipo': row['Tipo'] # Adiciona o tipo para diferenciar real/escala
+                'Inicio': start,
+                'Fim': segment_end,
+                'Dia': current_day,
+                'Grupo': row.get('Grupo', 'Não Definido') # Adiciona grupo se existir
             })
-            # O status continua no início do próximo dia
-            current_start = datetime.combine(current_start.date() + timedelta(days=1), time(0, 0, 0))
 
-        # Adiciona a parte final do status (ou o status completo se não atravessou dias)
-        processed_data.append({
-            'Agente': row['Agente'],
-            'Status': row['Status'],
-            'Start Time': current_start,
-            'End Time': end_time,
-            'Tipo': row['Tipo']
-        })
-    return pd.DataFrame(processed_data)
+            # Prepara para o próximo dia
+            start = datetime.combine(current_day + timedelta(days=1), time(0, 0, 0))
+            current_day += timedelta(days=1)
 
-# --- Seção de Upload do Relatório ---
-st.header("1. Upload do Relatório de Status")
-uploaded_file = st.file_uploader("Escolha um arquivo CSV ou Excel", type=["csv", "xlsx"])
+            # Se o status já terminou, sai do loop
+            if start > end:
+                break
+    return pd.DataFrame(new_rows)
+
+# --- Dicionário de cores para os status ---
+status_colors = {
+    'unified online': 'green',
+    'unified away': 'orange',
+    'unified offline': 'red',
+    'unified transfers only': 'blue',
+    # Adicione mais status e cores conforme necessário
+    'não definido': 'lightgray' # Cor padrão para status não mapeados
+}
+
+# --- Inicialização de estado para a escala ---
+if 'df_escala' not in st.session_state:
+    st.session_state.df_escala = pd.DataFrame(columns=['Agente', 'Status', 'Inicio', 'Fim', 'Dia', 'Grupo'])
+
+# --- Seção de Upload de Relatório ---
+st.header("1. Carregar Relatório de Status")
+uploaded_file = st.file_uploader("Escolha um arquivo Excel (.xlsx)", type=["xlsx"])
 
 df_real_status = pd.DataFrame()
 if uploaded_file is not None:
     try:
-        if uploaded_file.name.endswith('.csv'):
-            df_real_status = pd.read_csv(uploaded_file)
-        else:
-            df_real_status = pd.read_excel(uploaded_file)
+        df_raw = pd.read_excel(uploaded_file)
 
-        st.success("Relatório carregado com sucesso!")
-        st.subheader("Prévia do Relatório Carregado:")
+        # Renomear colunas do seu arquivo para os nomes esperados pelo código
+        df_real_status = df_raw.rename(columns={
+            'Nome do agente': 'Agente',
+            'Estado': 'Status',
+            'Hora de início do estado - Carimbo de data/hora': 'Inicio',
+            'Hora de término do estado - Carimbo de data/hora': 'Fim',
+            # Se você tiver uma coluna de grupo no seu Excel, adicione aqui:
+            # 'Nome da Coluna de Grupo': 'Grupo'
+        })
+
+        # Converter colunas de data/hora para o formato datetime
+        df_real_status['Inicio'] = pd.to_datetime(df_real_status['Inicio'], errors='coerce')
+        df_real_status['Fim'] = pd.to_datetime(df_real_status['Fim'], errors='coerce')
+
+        # Remover linhas com datas inválidas após a conversão
+        df_real_status.dropna(subset=['Inicio'], inplace=True)
+
+        # Adicionar coluna 'Dia' para facilitar a filtragem e a função split_status_across_days
+        df_real_status['Dia'] = df_real_status['Inicio'].dt.date
+
+        # Adicionar coluna 'Grupo' se não existir (para o filtro)
+        if 'Grupo' not in df_real_status.columns:
+            df_real_status['Grupo'] = 'Não Definido'
+
+        # Aplicar a função para dividir status que atravessam a meia-noite
+        df_real_status = split_status_across_days(df_real_status)
+
+        st.success("Relatório carregado e processado com sucesso!")
         st.dataframe(df_real_status.head())
 
-        # Assumindo que o relatório tem colunas como 'Agente', 'Status', 'Inicio', 'Fim'
-        # Adapte os nomes das colunas conforme o seu relatório real
-        required_cols = ['Agente', 'Status', 'Inicio', 'Fim'] # Exemplo, ajuste conforme seu anexo
-        if all(col in df_real_status.columns for col in required_cols):
-            df_real_status = df_real_status.rename(columns={
-                'Inicio': 'Start Time', 
-                'Fim': 'End Time'
-            })
-            df_real_status['Start Time'] = pd.to_datetime(df_real_status['Start Time'])
-            df_real_status['End Time'] = pd.to_datetime(df_real_status['End Time'])
-            df_real_status['Tipo'] = 'Real' # Adiciona uma coluna para diferenciar
-
-            # Aplica a função de divisão de status
-            df_real_status = split_status_across_days(df_real_status)
-
-            st.session_state['df_real_status'] = df_real_status
-            st.success("Dados do relatório processados e prontos para visualização.")
-        else:
-            st.error(f"O relatório deve conter as colunas: {', '.join(required_cols)}. Por favor, verifique o arquivo.")
-            st.session_state['df_real_status'] = pd.DataFrame() # Limpa o estado se houver erro
     except Exception as e:
-        st.error(f"Erro ao ler o arquivo: {e}")
-        st.session_state['df_real_status'] = pd.DataFrame()
-else:
-    st.info("Por favor, faça o upload de um relatório para começar.")
+        st.error(f"Erro ao carregar ou processar o arquivo: {e}")
 
-# --- Seção de Criação/Edição da Escala ---
+# --- Seção de Criar/Editar Escala de Agentes ---
 st.header("2. Criar/Editar Escala de Agentes")
 
-# Inicializa a escala no session_state se não existir
-if 'df_escala' not in st.session_state:
-    st.session_state['df_escala'] = pd.DataFrame(columns=['Agente', 'Dia', 'Inicio', 'Fim', 'Status', 'Tipo'])
+with st.expander("Adicionar nova entrada na escala"):
+    with st.form("form_add_escala"):
+        agente_escala = st.text_input("Nome do Agente (Escala)")
+        status_escala = st.selectbox("Status (Escala)", list(status_colors.keys()) + ['Outro Status'])
+        if status_escala == 'Outro Status':
+            status_escala = st.text_input("Digite o novo Status")
 
-# Obter lista de agentes do relatório ou permitir adicionar manualmente
-agentes_disponiveis = []
-if 'df_real_status' in st.session_state and not st.session_state['df_real_status'].empty:
-    agentes_disponiveis = st.session_state['df_real_status']['Agente'].unique().tolist()
+        col1, col2 = st.columns(2)
+        data_inicio_escala = col1.date_input("Data de Início (Escala)")
+        hora_inicio_escala = col2.time_input("Hora de Início (Escala)")
 
-# Interface para adicionar um novo item à escala
-with st.expander("Adicionar item à escala"):
-    col1, col2 = st.columns(2)
-    with col1:
-        agente_selecionado = st.selectbox("Agente", [''] + agentes_disponiveis, key="escala_agente_select")
-        novo_dia = st.date_input("Dia", datetime.now().date(), key="escala_dia")
-        novo_status_escala = st.text_input("Status da Escala (ex: Trabalho, Pausa, Almoço)", "Trabalho", key="escala_status")
-    with col2:
-        novo_inicio = st.time_input("Início", time(9, 0), key="escala_inicio")
-        novo_fim = st.time_input("Fim", time(17, 0), key="escala_fim")
+        col3, col4 = st.columns(2)
+        data_fim_escala = col3.date_input("Data de Fim (Escala)")
+        hora_fim_escala = col4.time_input("Hora de Fim (Escala)")
 
-    if st.button("Adicionar à Escala"):
-        if agente_selecionado and novo_dia and novo_inicio and novo_fim and novo_status_escala:
-            # Combina data e hora para criar datetime objects
-            start_dt = datetime.combine(novo_dia, novo_inicio)
-            end_dt = datetime.combine(novo_dia, novo_fim)
+        grupo_escala = st.text_input("Grupo (Escala)", value="Não Definido")
 
-            if end_dt <= start_dt:
-                st.warning("A hora de fim deve ser posterior à hora de início.")
-            else:
-                nova_linha = pd.DataFrame([{
-                    'Agente': agente_selecionado,
-                    'Dia': novo_dia,
-                    'Inicio': start_dt,
-                    'Fim': end_dt,
-                    'Status': novo_status_escala,
-                    'Tipo': 'Escala'
+        submitted_escala = st.form_submit_button("Adicionar à Escala")
+        if submitted_escala:
+            if agente_escala and status_escala:
+                inicio_dt = datetime.combine(data_inicio_escala, hora_inicio_escala)
+                fim_dt = datetime.combine(data_fim_escala, hora_fim_escala)
+
+                new_row_escala = pd.DataFrame([{
+                    'Agente': agente_escala,
+                    'Status': status_escala.lower(), # Normaliza para minúsculas
+                    'Inicio': inicio_dt,
+                    'Fim': fim_dt,
+                    'Dia': inicio_dt.date(),
+                    'Grupo': grupo_escala
                 }])
-                st.session_state['df_escala'] = pd.concat([st.session_state['df_escala'], nova_linha], ignore_index=True)
-                st.success(f"Item adicionado à escala para {agente_selecionado}.")
-        else:
-            st.warning("Por favor, preencha todos os campos para adicionar à escala.")
+                st.session_state.df_escala = pd.concat([st.session_state.df_escala, new_row_escala], ignore_index=True)
+                st.success(f"Escala para {agente_escala} adicionada.")
+            else:
+                st.warning("Por favor, preencha o nome do agente e o status da escala.")
 
 st.subheader("Escala Atual:")
-if not st.session_state['df_escala'].empty:
-    # Exibe a escala e permite edição/exclusão
-    st.dataframe(st.session_state['df_escala'].drop(columns=['Tipo']).sort_values(by=['Agente', 'Dia', 'Inicio']), use_container_width=True)
-
-    # Opção para limpar a escala
-    if st.button("Limpar Escala"):
-        st.session_state['df_escala'] = pd.DataFrame(columns=['Agente', 'Dia', 'Inicio', 'Fim', 'Status', 'Tipo'])
-        st.success("Escala limpa.")
+if not st.session_state.df_escala.empty:
+    st.dataframe(st.session_state.df_escala)
 else:
-    st.info("Nenhum item na escala ainda. Adicione acima.")
+    st.info("Nenhuma escala adicionada ainda.")
 
-# --- Seção de Visualização Gantt ---
-st.header("3. Visualização Gantt de Acompanhamento")
+# --- Combinação dos DataFrames ---
+df_combined = pd.DataFrame()
+if not df_real_status.empty and not st.session_state.df_escala.empty:
+    df_real_status['Tipo'] = 'Real'
+    st.session_state.df_escala['Tipo'] = 'Escala'
+    df_combined = pd.concat([df_real_status, st.session_state.df_escala], ignore_index=True)
+elif not df_real_status.empty:
+    df_real_status['Tipo'] = 'Real'
+    df_combined = df_real_status
+elif not st.session_state.df_escala.empty:
+    st.session_state.df_escala['Tipo'] = 'Escala'
+    df_combined = st.session_state.df_escala
 
-df_combinado = pd.DataFrame()
-if 'df_real_status' in st.session_state and not st.session_state['df_real_status'].empty:
-    # Prepara df_escala para combinação
-    df_escala_temp = st.session_state['df_escala'].copy()
-    if not df_escala_temp.empty:
-        df_escala_temp = df_escala_temp.rename(columns={'Inicio': 'Start Time', 'Fim': 'End Time'})
-        # Aplica a função de divisão de status também para a escala
-        df_escala_temp = split_status_across_days(df_escala_temp)
-        df_combinado = pd.concat([st.session_state['df_real_status'], df_escala_temp], ignore_index=True)
+# --- Seção de Visualização e Filtros ---
+st.header("3. Visualização e Filtros")
+
+if not df_combined.empty:
+    # Garantir que 'Status' esteja em minúsculas para o mapeamento de cores
+    df_combined['Status'] = df_combined['Status'].str.lower()
+
+    # Filtros
+    all_agents = sorted(df_combined['Agente'].unique())
+    selected_agents = st.multiselect("Filtrar por Agente(s)", all_agents, default=all_agents)
+
+    all_days = sorted(df_combined['Dia'].unique())
+    selected_days = st.multiselect("Filtrar por Dia(s)", all_days, default=all_days)
+
+    all_groups = sorted(df_combined['Grupo'].unique())
+    selected_groups = st.multiselect("Filtrar por Grupo(s)", all_groups, default=all_groups)
+
+    df_filtered = df_combined[
+        (df_combined['Agente'].isin(selected_agents)) &
+        (df_combined['Dia'].isin(selected_days)) &
+        (df_combined['Grupo'].isin(selected_groups))
+    ]
+
+    if not df_filtered.empty:
+        # Criar o gráfico Gantt
+        fig = px.timeline(
+            df_filtered,
+            x_start="Inicio",
+            x_end="Fim",
+            y="Agente",
+            color="Status",
+            facet_row="Dia", # Divide por dia
+            # text="Status", # Opcional: mostra o texto do status na barra
+            color_discrete_map=status_colors,
+            title="Comparativo de Escala vs. Status Real dos Agentes",
+            hover_name="Status",
+            hover_data={"Inicio": "|%Y-%m-%d %H:%M:%S", "Fim": "|%Y-%m-%d %H:%M:%S", "Tipo": True, "Grupo": True}
+        )
+
+        fig.update_yaxes(autorange="reversed") # Agentes em ordem alfabética
+        fig.update_layout(height=max(600, len(df_filtered['Agente'].unique()) * len(df_filtered['Dia'].unique()) * 30)) # Ajusta altura dinamicamente
+
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        df_combinado = st.session_state['df_real_status'].copy()
-
-    if not df_combinado.empty:
-        # --- Filtros ---
-        st.subheader("Filtros")
-        col_filtros1, col_filtros2, col_filtros3 = st.columns(3)
-
-        with col_filtros1:
-            todos_agentes = ['Todos'] + df_combinado['Agente'].unique().tolist()
-            filtro_agente = st.selectbox("Filtrar por Agente", todos_agentes)
-
-        with col_filtros2:
-            min_date = df_combinado['Start Time'].min().date() if not df_combinado.empty else datetime.now().date()
-            max_date = df_combinado['End Time'].max().date() if not df_combinado.empty else datetime.now().date()
-            filtro_data_inicio = st.date_input("Data Início", min_date)
-            filtro_data_fim = st.date_input("Data Fim", max_date)
-
-        with col_filtros3:
-            # Para grupos, você precisaria de uma coluna 'Grupo' no seu relatório ou escala.
-            # Por enquanto, vamos simular ou deixar como um placeholder.
-            # Se você tiver uma coluna 'Grupo' no seu df_combinado, pode usá-la aqui.
-            # Exemplo: grupos_disponiveis = ['Todos'] + df_combinado['Grupo'].unique().tolist()
-            # filtro_grupo = st.selectbox("Filtrar por Grupo", grupos_disponiveis)
-            st.info("Funcionalidade de filtro por grupo requer uma coluna 'Grupo' nos dados.")
-            filtro_grupo = 'Todos' # Placeholder
-
-        df_filtrado = df_combinado.copy()
-
-        # Aplicar filtro de agente
-        if filtro_agente != 'Todos':
-            df_filtrado = df_filtrado[df_filtrado['Agente'] == filtro_agente]
-
-        # Aplicar filtro de data
-        df_filtrado = df_filtrado[
-            (df_filtrado['Start Time'].dt.date >= filtro_data_inicio) &
-            (df_filtrado['End Time'].dt.date <= filtro_data_fim)
-        ]
-
-        # Aplicar filtro de grupo (se implementado)
-        # if filtro_grupo != 'Todos' and 'Grupo' in df_filtrado.columns:
-        #     df_filtrado = df_filtrado[df_filtrado['Grupo'] == filtro_grupo]
-
-        if not df_filtrado.empty:
-            # Ordenar para melhor visualização
-            df_filtrado = df_filtrado.sort_values(by=['Agente', 'Start Time'])
-
-            # Criação do gráfico Gantt
-            # Usamos 'Tipo' (Real/Escala) para colorir e diferenciar
-            fig = px.timeline(
-                df_filtrado, 
-                x_start="Start Time", 
-                x_end="End Time", 
-                y="Agente", 
-                color="Tipo", # Colore por 'Real' ou 'Escala'
-                text="Status", # Mostra o status no gráfico
-                hover_name="Status", # Nome ao passar o mouse
-                hover_data={"Start Time": "|%Y-%m-%d %H:%M", "End Time": "|%Y-%m-%d %H:%M", "Tipo": True},
-                title="Comparativo de Escala vs. Status Real",
-                color_discrete_map={'Real': 'blue', 'Escala': 'green'} # Cores personalizadas
-            )
-
-            fig.update_yaxes(autorange="reversed") # Agentes em ordem normal
-            fig.update_layout(
-                xaxis_title="Tempo",
-                yaxis_title="Agente",
-                hovermode="x unified",
-                height=600 # Altura do gráfico
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Nenhum dado encontrado com os filtros aplicados.")
-    else:
-        st.info("Faça o upload de um relatório e/ou crie uma escala para visualizar o gráfico.")
+        st.info("Nenhum dado para exibir com os filtros selecionados.")
 else:
-    st.info("Faça o upload de um relatório para visualizar o gráfico.")
-
-st.markdown("---")
-st.markdown("Desenvolvido com Streamlit")
+    st.info("Por favor, carregue um relatório e/ou adicione entradas na escala para visualizar os dados.")

@@ -8,6 +8,13 @@ import numpy as np
 st.set_page_config(layout="wide", page_title="Dashboard de Acompanhamento de Call Center")
 st.title("Dashboard de Acompanhamento de Equipe de Call Center")
 
+# --- Mapeamento de dias da semana para facilitar a comparação ---
+dias_semana_map = {
+    "Seg": "Monday", "Ter": "Tuesday", "Qua": "Wednesday",
+    "Qui": "Thursday", "Sex": "Friday", "Sab": "Saturday", "Dom": "Sunday"
+}
+dias_semana_map_inv = {v: k for k, v in dias_semana_map.items()}
+
 # --- Funções de Processamento de Dados ---
 
 def process_uploaded_report(uploaded_file):
@@ -34,8 +41,8 @@ def process_uploaded_report(uploaded_file):
             df['Hora de término do estado - Carimbo de data/hora'], errors='coerce'
         )
 
-        # Preencher NaT (Not a Time) na coluna de término com o início do dia seguinte
-        # ou o final do dia atual se o início for o último registro do dia
+        # Preencher NaT (Not a Time) na coluna de término com o final do dia atual
+        # Isso é uma heurística para status abertos, pode ser ajustado conforme a regra de negócio
         df['Hora de término do estado - Carimbo de data/hora'] = df.apply(
             lambda row: row['Hora de início do estado - Carimbo de data/hora'].replace(hour=23, minute=59, second=59)
             if pd.isna(row['Hora de término do estado - Carimbo de data/hora'])
@@ -46,393 +53,367 @@ def process_uploaded_report(uploaded_file):
         # Remover linhas onde a data de início é inválida
         df.dropna(subset=['Hora de início do estado - Carimbo de data/hora'], inplace=True)
 
-        # Ajustar a coluna 'Dia' para ser a data completa do início do estado
-        df['Data'] = df['Hora de início do estado - Carimbo de data/hora'].dt.normalize()
+        # Ajustar a coluna 'Dia' para ser a data completa
+        df['Data'] = df['Hora de início do estado - Carimbo de data/hora'].dt.date
 
-        # Criar uma coluna 'ID do Agente' para o Plotly Gantt
-        df['ID do Agente'] = df['Nome do agente'] + ' - ' + df['Data'].dt.strftime('%Y-%m-%d')
+        # Renomear para consistência
+        df.rename(columns={
+            'Hora de início do estado - Carimbo de data/hora': 'Inicio',
+            'Hora de término do estado - Carimbo de data/hora': 'Fim',
+            'Status': 'Tipo' # Renomear para 'Tipo' para o gráfico
+        }, inplace=True)
 
-        st.session_state.df_real_status = df
+        # Filtrar apenas o status 'Unified online' para o gráfico de status real
+        df_online = df[df['Tipo'] == 'Unified online'].copy()
+        df_online['Tipo'] = 'Status Real (Online)' # Para diferenciar no gráfico
+
+        st.session_state.df_real_status = df_online
         st.success("Relatório de status carregado e processado com sucesso!")
     except Exception as e:
-        st.error(f"Erro ao processar o relatório: {e}")
-        st.info("Verifique se o arquivo está no formato esperado e se as colunas de data/hora estão corretas.")
+        st.error(f"Erro ao processar o relatório de status: {e}")
+        st.exception(e)
 
 def process_uploaded_scale(uploaded_file):
-    """Processa o arquivo de escala dos agentes."""
+    """Processa o arquivo de escala do agente."""
     try:
         df_escala_raw = pd.read_excel(uploaded_file)
 
-        # Renomear a coluna 'NOME' para 'Nome do agente' para consistência
+        # Verificar e renomear a coluna 'NOME' para 'Nome do agente'
         if 'NOME' in df_escala_raw.columns:
             df_escala_raw.rename(columns={'NOME': 'Nome do agente'}, inplace=True)
         else:
-            st.error("Coluna 'NOME' não encontrada no arquivo de escala. Verifique o cabeçalho.")
+            st.error("Coluna 'NOME' não encontrada no arquivo de escala. Certifique-se de que o cabeçalho está correto.")
             return
 
-        # Converter 'ENTRADA' e 'SAÍDA' para objetos time
-        df_escala_raw['Entrada'] = pd.to_datetime(df_escala_raw['ENTRADA'], format='%H:%M:%S', errors='coerce').dt.time
-        df_escala_raw['Saída'] = pd.to_datetime(df_escala_raw['SAÍDA'], format='%H:%M:%S', errors='coerce').dt.time
+        # Preencher NaNs nas colunas de horário com '00:00:00' antes da conversão
+        df_escala_raw['ENTRADA'] = df_escala_raw['ENTRADA'].fillna('00:00:00')
+        df_escala_raw['SAÍDA'] = df_escala_raw['SAÍDA'].fillna('00:00:00')
 
+        # Converter ENTRADA e SAÍDA para objetos time, com tratamento de erros
+        df_escala_raw['Entrada'] = pd.to_datetime(df_escala_raw['ENTRADA'].astype(str), format='%H:%M:%S', errors='coerce').dt.time
+        df_escala_raw['Saída'] = pd.to_datetime(df_escala_raw['SAÍDA'].astype(str), format='%H:%M:%S', errors='coerce').dt.time
+
+        # Remover linhas onde a conversão de horário falhou
         df_escala_raw.dropna(subset=['Entrada', 'Saída'], inplace=True)
 
         # Expandir a escala para cada dia da semana
-        escala_expandida = []
-        dias_semana_map = {
-            'Seg': 0, 'Ter': 1, 'Qua': 2, 'Qui': 3, 'Sex': 4, 'Sab': 5, 'Dom': 6
-        }
+        escala_expanded = []
+        for _, row in df_escala_raw.iterrows():
+            agente = row['Nome do agente']
+            dias_atendimento_str = str(row['DIAS DE ATENDIMENTO']).replace(' ', '').split(',')
+            entrada = row['Entrada']
+            saida = row['Saída']
 
-        for index, row in df_escala_raw.iterrows():
-            dias_atendimento_str = str(row['DIAS DE ATENDIMENTO'])
-            dias_atendimento = [d.strip() for d in dias_atendimento_str.split(',')]
+            # Tratar casos como "Seg e Qui loja, Ter, Qua e Sex Call"
+            dias_validos = []
+            for dia_str in dias_atendimento_str:
+                for k, v in dias_semana_map.items():
+                    if k in dia_str:
+                        dias_validos.append(v)
+                        break # Adiciona apenas uma vez por dia
 
-            for dia_str in dias_atendimento:
-                if dia_str in dias_semana_map:
-                    escala_expandida.append({
-                        'Nome do agente': row['Nome do agente'],
-                        'Dia da Semana Num': dias_semana_map[dia_str],
-                        'Dia da Semana': dia_str,
-                        'Entrada': row['Entrada'],
-                        'Saída': row['Saída'],
-                        'Grupo': row.get('GRUPO', 'Não Atribuído') # Adiciona a coluna Grupo se existir
-                    })
+            for dia_semana_pt in dias_validos:
+                escala_expanded.append({
+                    'Nome do agente': agente,
+                    'Dia da Semana': dia_semana_pt,
+                    'Entrada': entrada,
+                    'Saída': saida,
+                    'Grupo': row.get('CARGA', 'N/A') # Usar 'CARGA' como grupo ou 'N/A'
+                })
 
-        st.session_state.df_escala = pd.DataFrame(escala_expandida)
+        st.session_state.df_escala = pd.DataFrame(escala_expanded)
         st.success("Escala carregada e processada com sucesso!")
     except Exception as e:
         st.error(f"Erro ao processar o arquivo de escala: {e}")
-        st.info("Verifique se o arquivo está no formato esperado (colunas NOME, DIAS DE ATENDIMENTO, ENTRADA, SAÍDA).")
-
+        st.exception(e)
 
 # --- Inicialização do Session State ---
 if 'df_real_status' not in st.session_state:
-    st.session_state.df_real_status = pd.DataFrame()
+    st.session_state.df_real_status = pd.DataFrame(columns=['Nome do agente', 'Data', 'Inicio', 'Fim', 'Tipo'])
 if 'df_escala' not in st.session_state:
-    st.session_state.df_escala = pd.DataFrame(columns=['Nome do agente', 'Dia da Semana Num', 'Dia da Semana', 'Entrada', 'Saída', 'Grupo'])
-if 'grupos_agentes' not in st.session_state:
-    st.session_state.grupos_agentes = {
-        '6h20min': [],
-        '8h12min': []
-    }
+    st.session_state.df_escala = pd.DataFrame(columns=['Nome do agente', 'Dia da Semana', 'Entrada', 'Saída', 'Grupo'])
+if 'grupos_manuais' not in st.session_state:
+    st.session_state.grupos_manuais = ['6h20min', '8h12min', 'Outro Grupo']
 
 # --- Abas do Aplicativo ---
 tab1, tab2, tab3 = st.tabs(["Upload de Relatório", "Criar/Editar Escala", "Visualização da Escala"])
 
 with tab1:
-    st.header("Upload do Relatório de Status")
-    uploaded_file_report = st.file_uploader("Escolha um arquivo Excel do relatório de status", type=["xlsx"])
-    if uploaded_file_report is not None:
+    st.header("Upload do Relatório de Status dos Agentes")
+    uploaded_file_report = st.file_uploader("Escolha um arquivo Excel (.xlsx) para o relatório de status", type=["xlsx"], key="report_uploader")
+    if uploaded_file_report:
         process_uploaded_report(uploaded_file_report)
 
 with tab2:
     st.header("Criar/Editar Escala de Agentes")
 
-    st.subheader("Upload de Arquivo de Escala (Excel)")
-    uploaded_file_scale = st.file_uploader("Escolha um arquivo Excel com a escala", type=["xlsx"])
-    if uploaded_file_scale is not None:
-        process_uploaded_scale(uploaded_file_scale)
+    st.subheader("Carregar Escala via Arquivo Excel")
+    uploaded_file_escala = st.file_uploader("Escolha um arquivo Excel (.xlsx) para a escala", type=["xlsx"], key="escala_uploader")
+    if uploaded_file_escala:
+        process_uploaded_scale(uploaded_file_escala)
 
-    st.subheader("Adicionar Escala Manualmente")
-
-    # Obter nomes de agentes do relatório de status, se disponível
-    all_agents_in_data = set()
-    if not st.session_state.df_real_status.empty:
-        all_agents_in_data.update(st.session_state.df_real_status['Nome do agente'].unique())
-
-    # Obter nomes de agentes da escala existente, se disponível
-    if not st.session_state.df_escala.empty:
+    st.subheader("Adicionar Agente à Escala Manualmente")
+    with st.form("form_add_agent_scale"):
+        # Obter todos os agentes únicos do relatório real e da escala existente
+        all_agents_in_data = set(st.session_state.df_real_status['Nome do agente'].unique())
         all_agents_in_data.update(st.session_state.df_escala['Nome do agente'].unique())
 
-    # Converter para lista e ordenar para o selectbox
-    agent_options = sorted(list(all_agents_in_data))
+        agent_options = sorted(list(all_agents_in_data))
+        agent_options.insert(0, "(Novo Agente)")
 
-    if not agent_options:
-        st.warning("Carregue o relatório de status ou o arquivo de escala para popular a lista de agentes.")
-        new_agent_name = st.text_input("Ou digite o nome do novo agente:")
-        selected_agent_for_scale = new_agent_name if new_agent_name else ""
+        selected_agent_manual = st.selectbox("Selecione o Agente", agent_options, key="selected_agent_manual")
+        new_agent_name = ""
+        if selected_agent_manual == "(Novo Agente)":
+            new_agent_name = st.text_input("Nome do Novo Agente", key="new_agent_name_input")
+
+        dia_semana_manual = st.multiselect("Dias da Semana", list(dias_semana_map.keys()), key="dia_semana_manual")
+        hora_inicio_manual = st.time_input("Hora de Início", value=time(9, 0), key="hora_inicio_manual")
+        hora_fim_manual = st.time_input("Hora de Término", value=time(17, 0), key="hora_fim_manual")
+
+        grupo_options = sorted(list(set(st.session_state.df_escala['Grupo'].unique()).union(st.session_state.grupos_manuais)))
+        grupo_options.insert(0, "Selecione um Grupo")
+        selected_grupo_manual = st.selectbox("Grupo (Escala)", grupo_options, key="selected_grupo_manual")
+
+        new_grupo_name = ""
+        if selected_grupo_manual == "Outro Grupo":
+            new_grupo_name = st.text_input("Nome do Novo Grupo", key="new_grupo_name_input")
+
+        submitted = st.form_submit_button("Adicionar à Escala")
+        if submitted:
+            agent_to_add = new_agent_name if selected_agent_manual == "(Novo Agente)" else selected_agent_manual
+            grupo_to_add = new_grupo_name if selected_grupo_manual == "Outro Grupo" else selected_grupo_manual
+
+            if agent_to_add and dia_semana_manual and grupo_to_add != "Selecione um Grupo":
+                new_entries = []
+                for dia in dia_semana_manual:
+                    new_entries.append({
+                        'Nome do agente': agent_to_add,
+                        'Dia da Semana': dias_semana_map[dia],
+                        'Entrada': hora_inicio_manual,
+                        'Saída': hora_fim_manual,
+                        'Grupo': grupo_to_add
+                    })
+
+                if not new_entries:
+                    st.warning("Nenhuma entrada válida para adicionar. Verifique os dias da semana selecionados.")
+                else:
+                    st.session_state.df_escala = pd.concat([st.session_state.df_escala, pd.DataFrame(new_entries)], ignore_index=True)
+                    st.success(f"Escala para {agent_to_add} adicionada com sucesso!")
+                    if new_grupo_name and new_grupo_name not in st.session_state.grupos_manuais:
+                        st.session_state.grupos_manuais.append(new_grupo_name)
+            else:
+                st.warning("Por favor, preencha todos os campos para adicionar à escala.")
+
+    st.subheader("Escala Atual")
+    if not st.session_state.df_escala.empty:
+        st.dataframe(st.session_state.df_escala, use_container_width=True)
     else:
-        selected_agent_for_scale = st.selectbox("Selecione o agente", [""] + agent_options)
-        new_agent_name = st.text_input("Ou digite o nome do novo agente (se não estiver na lista):")
-        if new_agent_name:
-            selected_agent_for_scale = new_agent_name
-
-    dias_semana_options = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"]
-    selected_dias_semana = st.multiselect("Dias da Semana", dias_semana_options)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        start_time = st.time_input("Hora de Entrada", value=time(9, 0))
-    with col2:
-        end_time = st.time_input("Hora de Saída", value=time(18, 0))
-
-    if st.button("Adicionar Escala"):
-        if selected_agent_for_scale and selected_dias_semana and start_time and end_time:
-            dias_semana_map = {
-                'Seg': 0, 'Ter': 1, 'Qua': 2, 'Qui': 3, 'Sex': 4, 'Sab': 5, 'Dom': 6
-            }
-            for dia_str in selected_dias_semana:
-                new_entry = {
-                    'Nome do agente': selected_agent_for_scale,
-                    'Dia da Semana Num': dias_semana_map[dia_str],
-                    'Dia da Semana': dia_str,
-                    'Entrada': start_time,
-                    'Saída': end_time,
-                    'Grupo': 'Não Atribuído' # Default para manual
-                }
-                st.session_state.df_escala = pd.concat([st.session_state.df_escala, pd.DataFrame([new_entry])], ignore_index=True)
-            st.success(f"Escala adicionada para {selected_agent_for_scale} nos dias {', '.join(selected_dias_semana)}.")
-        else:
-            st.warning("Preencha todos os campos para adicionar a escala.")
-
-    st.subheader("Gerenciar Grupos de Agentes")
-    group_name_input = st.text_input("Nome do novo grupo (ex: '6h20min', '8h12min')")
-    if st.button("Criar Grupo"):
-        if group_name_input and group_name_input not in st.session_state.grupos_agentes:
-            st.session_state.grupos_agentes[group_name_input] = []
-            st.success(f"Grupo '{group_name_input}' criado.")
-        elif group_name_input in st.session_state.grupos_agentes:
-            st.warning(f"Grupo '{group_name_input}' já existe.")
-        else:
-            st.warning("Digite um nome para o grupo.")
-
-    if st.session_state.grupos_agentes:
-        selected_group_to_manage = st.selectbox("Selecione um grupo para gerenciar", list(st.session_state.grupos_agentes.keys()))
-
-        # Obter todos os agentes disponíveis (do relatório e da escala)
-        all_available_agents = set()
-        if not st.session_state.df_real_status.empty:
-            all_available_agents.update(st.session_state.df_real_status['Nome do agente'].unique())
-        if not st.session_state.df_escala.empty:
-            all_available_agents.update(st.session_state.df_escala['Nome do agente'].unique())
-
-        # Agentes já no grupo selecionado
-        agents_in_current_group = set(st.session_state.grupos_agentes[selected_group_to_manage])
-
-        # Agentes que não estão no grupo selecionado
-        agents_not_in_current_group = sorted(list(all_available_agents - agents_in_current_group))
-
-        st.write(f"Agentes no grupo '{selected_group_to_manage}': {', '.join(agents_in_current_group) if agents_in_current_group else 'Nenhum'}")
-
-        if agents_not_in_current_group:
-            agent_to_add_to_group = st.selectbox(f"Adicionar agente ao grupo '{selected_group_to_manage}'", [""] + agents_not_in_current_group)
-            if st.button(f"Adicionar {agent_to_add_to_group} ao grupo"):
-                if agent_to_add_to_group:
-                    st.session_state.grupos_agentes[selected_group_to_manage].append(agent_to_add_to_group)
-                    # Atualizar a coluna 'Grupo' no df_escala para este agente
-                    st.session_state.df_escala.loc[st.session_state.df_escala['Nome do agente'] == agent_to_add_to_group, 'Grupo'] = selected_group_to_manage
-                    st.success(f"{agent_to_add_to_group} adicionado ao grupo '{selected_group_to_manage}'.")
-                    st.rerun()
-        else:
-            st.info(f"Todos os agentes disponíveis já estão no grupo '{selected_group_to_manage}' ou não há agentes disponíveis para adicionar.")
-
-        if agents_in_current_group:
-            agent_to_remove_from_group = st.selectbox(f"Remover agente do grupo '{selected_group_to_manage}'", [""] + sorted(list(agents_in_current_group)))
-            if st.button(f"Remover {agent_to_remove_from_group} do grupo"):
-                if agent_to_remove_from_group:
-                    st.session_state.grupos_agentes[selected_group_to_manage].remove(agent_to_remove_to_group)
-                    # Atualizar a coluna 'Grupo' no df_escala para este agente
-                    st.session_state.df_escala.loc[st.session_state.df_escala['Nome do agente'] == agent_to_remove_from_group, 'Grupo'] = 'Não Atribuído'
-                    st.success(f"{agent_to_remove_from_group} removido do grupo '{selected_group_to_manage}'.")
-                    st.rerun()
-
-        if st.button(f"Remover Grupo '{selected_group_to_manage}'"):
-            if selected_group_to_manage in st.session_state.grupos_agentes:
-                # Antes de remover o grupo, resetar o grupo dos agentes no df_escala
-                st.session_state.df_escala.loc[st.session_state.df_escala['Grupo'] == selected_group_to_manage, 'Grupo'] = 'Não Atribuído'
-                del st.session_state.grupos_agentes[selected_group_to_manage]
-                st.success(f"Grupo '{selected_group_to_manage}' removido.")
-                st.rerun()
-
+        st.info("Nenhuma escala carregada ou adicionada ainda.")
 
 with tab3:
     st.header("Visualização da Escala e Status Real")
 
-    if st.session_state.df_real_status.empty and st.session_state.df_escala.empty:
-        st.warning("Por favor, carregue o relatório de status e/ou a escala dos agentes nas abas anteriores.")
+    # --- Filtros na Barra Lateral ---
+    st.sidebar.header("Filtros")
+
+    all_agents_in_data = set(st.session_state.df_real_status['Nome do agente'].unique())
+    all_agents_in_data.update(st.session_state.df_escala['Nome do agente'].unique())
+
+    if not all_agents_in_data:
+        st.sidebar.warning("Carregue os relatórios para ver os agentes.")
+        selected_agents = []
     else:
-        # --- Filtros na Barra Lateral ---
-        st.sidebar.header("Filtros")
-
-        # Filtro por Agente
-        all_agents = set()
-        if not st.session_state.df_real_status.empty:
-            all_agents.update(st.session_state.df_real_status['Nome do agente'].unique())
-        if not st.session_state.df_escala.empty:
-            all_agents.update(st.session_state.df_escala['Nome do agente'].unique())
-
         selected_agents = st.sidebar.multiselect(
-            "Filtrar por Agente",
-            sorted(list(all_agents))
+            "Selecione os Agentes",
+            sorted(list(all_agents_in_data)),
+            key="filter_agents"
         )
 
-        # Filtro por Grupo
-        group_options = ["Todos"] + list(st.session_state.grupos_agentes.keys())
-        selected_group = st.sidebar.selectbox("Filtrar por Grupo", group_options)
+    all_groups = sorted(list(set(st.session_state.df_escala['Grupo'].unique()).union(st.session_state.grupos_manuais)))
+    selected_groups = st.sidebar.multiselect(
+        "Selecione os Grupos",
+        all_groups,
+        key="filter_groups"
+    )
 
-        # Filtro por Data
-        min_date = datetime(2026, 1, 1).date() # Data mínima padrão
-        max_date = datetime(2026, 12, 31).date() # Data máxima padrão
+    today = datetime.now().date()
+    default_start_date = today - timedelta(days=7) # Últimos 7 dias como padrão
+    default_end_date = today
 
-        if not st.session_state.df_real_status.empty:
-            min_date_report = st.session_state.df_real_status['Data'].min().date()
-            max_date_report = st.session_state.df_real_status['Data'].max().date()
-            min_date = min(min_date, min_date_report)
-            max_date = max(max_date, max_date_report)
+    date_range = st.sidebar.date_input(
+        "Selecione o Intervalo de Datas",
+        value=(default_start_date, default_end_date),
+        key="date_range_filter"
+    )
 
-        date_range = st.sidebar.date_input(
-            "Selecione o Intervalo de Datas",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
+    start_date = date_range[0] if date_range else None
+    end_date = date_range[1] if len(date_range) > 1 else start_date
 
-        start_date = date_range[0]
-        end_date = date_range[1] if len(date_range) > 1 else date_range[0]
-
-        # --- Aplicação dos Filtros ---
-        filtered_df_real_status = st.session_state.df_real_status.copy()
-        filtered_df_escala = st.session_state.df_escala.copy()
-
-        if selected_agents:
-            filtered_df_real_status = filtered_df_real_status[filtered_df_real_status['Nome do agente'].isin(selected_agents)]
-            # CORREÇÃO AQUI: Usar 'Nome do agente' para filtrar df_escala
-            filtered_df_escala = filtered_df_escala[filtered_df_escala['Nome do agente'].isin(selected_agents)]
-
-        if selected_group != "Todos":
-            agents_in_group = st.session_state.grupos_agentes.get(selected_group, [])
-            if agents_in_group:
-                filtered_df_real_status = filtered_df_real_status[filtered_df_real_status['Nome do agente'].isin(agents_in_group)]
-                # CORREÇÃO AQUI: Usar 'Nome do agente' para filtrar df_escala
-                filtered_df_escala = filtered_df_escala[filtered_df_escala['Nome do agente'].isin(agents_in_group)]
-            else:
-                filtered_df_real_status = pd.DataFrame() # Nenhum agente no grupo
-                filtered_df_escala = pd.DataFrame() # Nenhum agente no grupo
-
-        # Filtrar por data para o status real
-        filtered_df_real_status = filtered_df_real_status[
-            (filtered_df_real_status['Data'].dt.date >= start_date) &
-            (filtered_df_real_status['Data'].dt.date <= end_date)
-        ]
-
-        # --- Preparar dados para o gráfico Gantt ---
-        gantt_data = []
-
-        # Adicionar dados da escala
-        if not filtered_df_escala.empty:
-            for index, row in filtered_df_escala.iterrows():
-                # Gerar datas para cada dia da semana no intervalo selecionado
-                current_date = start_date
-                while current_date <= end_date:
-                    if current_date.weekday() == row['Dia da Semana Num']:
-                        start_dt = datetime.combine(current_date, row['Entrada'])
-                        end_dt = datetime.combine(current_date, row['Saída'])
-                        gantt_data.append({
-                            'Agente': row['Nome do agente'],
-                            'Data': current_date,
-                            'Tipo': 'Escala',
-                            'Status': 'Escala Prevista',
-                            'Start': start_dt,
-                            'Finish': end_dt,
-                            'Cor': 'lightgray' # Cor para a escala
-                        })
-                    current_date += timedelta(days=1)
-
-        # Adicionar dados de status real
-        if not filtered_df_real_status.empty:
-            for index, row in filtered_df_real_status.iterrows():
-                gantt_data.append({
-                    'Agente': row['Nome do agente'],
-                    'Data': row['Data'].date(),
-                    'Tipo': 'Real',
-                    'Status': row['Status'],
-                    'Start': row['Hora de início do estado - Carimbo de data/hora'],
-                    'Finish': row['Hora de término do estado - Carimbo de data/hora'],
-                    'Cor': 'blue' if row['Status'] == 'Unified online' else 'red' # Cores para status real
-                })
-
-        df_gantt = pd.DataFrame(gantt_data)
-
-        if not df_gantt.empty:
-            # Ordenar para melhor visualização
-            df_gantt = df_gantt.sort_values(by=['Agente', 'Data', 'Start'])
-
-            # Criar o gráfico Gantt
-            fig = px.timeline(
-                df_gantt,
-                x_start="Start",
-                x_end="Finish",
-                y="Agente",
-                color="Status",
-                facet_row="Data",
-                title="Comparativo de Escala e Status Real por Agente",
-                color_discrete_map={
-                    'Escala Prevista': 'lightgray',
-                    'Unified online': 'green',
-                    'Unified away': 'orange',
-                    'Unified offline': 'red',
-                    'Unified transfers only': 'purple',
-                    'Unified wrap up': 'brown'
-                }
+    # Limitar o intervalo de datas para evitar muitos subplots
+    if start_date and end_date:
+        if (end_date - start_date).days > 14: # Limite de 14 dias, ajuste conforme necessário
+            st.sidebar.warning("Por favor, selecione um intervalo de datas de no máximo 14 dias para uma melhor visualização do gráfico.")
+            end_date = start_date + timedelta(days=13) # Ajusta o fim para 14 dias a partir do início
+            st.sidebar.date_input(
+                "Intervalo de Datas Ajustado",
+                value=(start_date, end_date),
+                key="date_range_filter_adjusted",
+                disabled=True # Desabilita para mostrar que foi ajustado
             )
-            fig.update_yaxes(autorange="reversed") # Inverte a ordem para o agente mais recente ficar no topo
-            fig.update_layout(height=600 + len(df_gantt['Agente'].unique()) * 50) # Ajusta altura dinamicamente
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Nenhum dado para exibir com os filtros selecionados.")
 
-        # --- Cálculo e Exibição de Métricas de Disponibilidade e Aderência ---
-        st.subheader("Métricas de Disponibilidade e Aderência")
+    # --- Lógica de Filtragem e Geração do Gráfico ---
+    if selected_agents and start_date and end_date:
+        # Filtrar df_real_status
+        filtered_df_real_status = st.session_state.df_real_status[
+            (st.session_state.df_real_status['Nome do agente'].isin(selected_agents)) &
+            (st.session_state.df_real_status['Data'] >= start_date) &
+            (st.session_state.df_real_status['Data'] <= end_date)
+        ].copy()
 
-        if not filtered_df_real_status.empty and not filtered_df_escala.empty:
-            metrics_data = []
+        # Filtrar df_escala
+        filtered_df_escala = st.session_state.df_escala[
+            (st.session_state.df_escala['Nome do agente'].isin(selected_agents))
+        ].copy()
 
-            # Iterar por cada agente e cada dia no intervalo filtrado
-            for agent_name in filtered_df_real_status['Nome do agente'].unique():
-                for current_date in pd.date_range(start_date, end_date):
-                    current_date = current_date.date() # Apenas a data
+        if selected_groups:
+            filtered_df_escala = filtered_df_escala[filtered_df_escala['Grupo'].isin(selected_groups)]
+            # Ajustar selected_agents para incluir apenas os agentes dos grupos selecionados
+            agents_in_selected_groups = filtered_df_escala['Nome do agente'].unique()
+            selected_agents = [agent for agent in selected_agents if agent in agents_in_selected_groups]
+            filtered_df_real_status = filtered_df_real_status[filtered_df_real_status['Nome do agente'].isin(selected_agents)]
 
-                    # Escala para o agente no dia atual
-                    escala_do_dia = filtered_df_escala[
-                        (filtered_df_escala['Nome do agente'] == agent_name) &
-                        (filtered_df_escala['Dia da Semana Num'] == current_date.weekday())
-                    ]
 
-                    if not escala_do_dia.empty:
-                        escala_start_time = datetime.combine(current_date, escala_do_dia['Entrada'].iloc[0])
-                        escala_end_time = datetime.combine(current_date, escala_do_dia['Saída'].iloc[0])
+        if not filtered_df_real_status.empty or not filtered_df_escala.empty:
+            # Expandir a escala para o intervalo de datas selecionado
+            expanded_escala_data = []
+            current_date = start_date
+            while current_date <= end_date:
+                day_of_week_en = current_date.strftime('%A') # Ex: 'Monday'
 
-                        # Garantir que a escala não passe da meia-noite para o cálculo simples
-                        if escala_end_time < escala_start_time:
-                            escala_end_time += timedelta(days=1)
+                escala_do_dia = filtered_df_escala[
+                    filtered_df_escala['Dia da Semana'] == day_of_week_en
+                ]
 
-                        total_tempo_escala_segundos = (escala_end_time - escala_start_time).total_seconds()
+                for _, row_escala in escala_do_dia.iterrows():
+                    escala_start_dt = datetime.combine(current_date, row_escala['Entrada'])
+                    escala_end_dt = datetime.combine(current_date, row_escala['Saída'])
 
-                        # Status real do agente no dia atual
-                        status_real_do_dia = filtered_df_real_status[
+                    # Se a escala vira o dia (ex: 22:00-06:00)
+                    if escala_end_dt < escala_start_dt:
+                        escala_end_dt += timedelta(days=1)
+
+                    expanded_escala_data.append({
+                        'Nome do agente': row_escala['Nome do agente'],
+                        'Data': current_date,
+                        'Inicio': escala_start_dt,
+                        'Fim': escala_end_dt,
+                        'Tipo': 'Escala'
+                    })
+                current_date += timedelta(days=1)
+
+            df_expanded_escala = pd.DataFrame(expanded_escala_data)
+
+            # Concatenar dados de escala e status real para o gráfico
+            df_gantt = pd.concat([df_expanded_escala, filtered_df_real_status], ignore_index=True)
+
+            # Garantir que apenas agentes selecionados e com dados estejam no df_gantt
+            df_gantt = df_gantt[df_gantt['Nome do agente'].isin(selected_agents)]
+
+            if not df_gantt.empty:
+                # Ordenar para melhor visualização
+                df_gantt = df_gantt.sort_values(by=['Data', 'Nome do agente', 'Inicio'])
+
+                # Ajustar altura do gráfico dinamicamente
+                num_unique_rows = df_gantt['Nome do agente'].nunique() * df_gantt['Data'].nunique()
+                chart_height = max(400, num_unique_rows * 50) # Altura mínima de 400px, 50px por linha de agente/dia
+
+                st.subheader("Comparativo de Escala vs. Status Real (Online)")
+
+                # Aviso se muitos agentes selecionados
+                if len(selected_agents) > 10: # Limite arbitrário, ajuste conforme necessário
+                    st.warning(f"Você selecionou {len(selected_agents)} agentes. Para uma melhor visualização, considere selecionar menos agentes.")
+
+                fig = px.timeline(
+                    df_gantt,
+                    x_start="Inicio",
+                    x_end="Fim",
+                    y="Nome do agente",
+                    color="Tipo",
+                    facet_row="Data",
+                    title="Comparativo de Escala vs. Status Real (Online)",
+                    color_discrete_map={'Escala': 'blue', 'Status Real (Online)': 'green'},
+                    height=chart_height,
+                    category_orders={"Tipo": ["Escala", "Status Real (Online)"]} # Garante ordem
+                )
+                fig.update_yaxes(categoryorder="array", categoryarray=selected_agents)
+                fig.update_xaxes(
+                    tickformat="%H:%M",
+                    range=[datetime.combine(start_date, time(0, 0, 0)), datetime.combine(start_date, time(23, 59, 59))],
+                    title="Hora do Dia"
+                )
+                fig.layout.xaxis.rangeselector.buttons = list([
+                    dict(count=1, label="1h", step="hour", stepmode="backward"),
+                    dict(count=6, label="6h", step="hour", stepmode="backward"),
+                    dict(count=12, label="12h", step="hour", stepmode="backward"),
+                    dict(count=1, label="1d", step="day", stepmode="backward"),
+                    dict(step="all")
+                ])
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("Métricas de Desempenho")
+                metrics_data = []
+                # Recalcular métricas apenas para os agentes e datas filtrados
+                for agent_name in selected_agents:
+                    for current_date in pd.date_range(start=start_date, end=end_date):
+                        current_date = current_date.date() # Garante que é apenas a data
+
+                        # Escala do agente para o dia
+                        escala_do_dia_agente = filtered_df_escala[
+                            (filtered_df_escala['Nome do agente'] == agent_name) &
+                            (filtered_df_escala['Dia da Semana'] == current_date.strftime('%A'))
+                        ]
+
+                        total_tempo_escala_segundos = 0
+                        for _, escala_row in escala_do_dia_agente.iterrows():
+                            escala_start_time = datetime.combine(current_date, escala_row['Entrada'])
+                            escala_end_time = datetime.combine(current_date, escala_row['Saída'])
+                            if escala_end_time < escala_start_time:
+                                escala_end_time += timedelta(days=1)
+                            total_tempo_escala_segundos += (escala_end_time - escala_start_time).total_seconds()
+
+                        # Status real do agente para o dia
+                        status_do_dia = filtered_df_real_status[
                             (filtered_df_real_status['Nome do agente'] == agent_name) &
-                            (filtered_df_real_status['Data'].dt.date == current_date)
-                        ].copy()
+                            (filtered_df_real_status['Data'] == current_date)
+                        ]
 
-                        total_online_na_escala_segundos = 0
                         total_online_segundos = 0
+                        total_online_na_escala_segundos = 0
 
-                        for idx, status_row in status_real_do_dia.iterrows():
-                            status_start = status_row['Hora de início do estado - Carimbo de data/hora']
-                            status_end = status_row['Hora de término do estado - Carimbo de data/hora']
+                        for _, status_row in status_do_dia.iterrows():
+                            status_start = status_row['Inicio']
+                            status_end = status_row['Fim']
 
                             # Garantir que o status não passe da meia-noite para o cálculo simples
-                            if status_end < status_start:
-                                status_end += timedelta(days=1)
+                            # Se o status termina no dia seguinte, ajustamos para o final do dia atual para o cálculo diário
+                            if status_end.date() > status_start.date():
+                                status_end = datetime.combine(status_start.date(), time(23, 59, 59))
 
-                            if status_row['Status'] == 'Unified online':
+                            if status_row['Tipo'] == 'Status Real (Online)': # Já filtrado para online
                                 total_online_segundos += (status_end - status_start).total_seconds()
 
                                 # Calcular interseção com a escala
-                                intersecao_start = max(status_start, escala_start_time)
-                                intersecao_end = min(status_end, escala_end_time)
+                                for _, escala_row in escala_do_dia_agente.iterrows():
+                                    escala_start_time = datetime.combine(current_date, escala_row['Entrada'])
+                                    escala_end_time = datetime.combine(current_date, escala_row['Saída'])
+                                    if escala_end_time < escala_start_time:
+                                        escala_end_time += timedelta(days=1) # Ajusta para o dia seguinte se virar a noite
 
-                                if intersecao_end > intersecao_start:
-                                    total_online_na_escala_segundos += (intersecao_end - intersecao_start).total_seconds()
+                                    intersecao_start = max(status_start, escala_start_time)
+                                    intersecao_end = min(status_end, escala_end_time)
+
+                                    if intersecao_end > intersecao_start:
+                                        total_online_na_escala_segundos += (intersecao_end - intersecao_start).total_seconds()
 
                         # Evitar divisão por zero
                         disponibilidade = (total_online_na_escala_segundos / total_tempo_escala_segundos) if total_tempo_escala_segundos > 0 else 0

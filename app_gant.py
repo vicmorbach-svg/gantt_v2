@@ -448,49 +448,67 @@ with tab_visualization:
                         df_expanded_scale_chart = pd.DataFrame(expanded_scale_for_chart)
                         df_chart_data = pd.concat([df_chart_data, df_expanded_scale_chart[['Agente_Data_Tipo', 'Start', 'Finish', 'Tipo', 'Nome do agente', 'Data']]])
 
-            if not df_chart_data.empty:
+                        if not df_chart_data.empty:
+                # Criar uma coluna 'Y_Axis_Label' para controlar o agrupamento no eixo Y
+                df_chart_data['Y_Axis_Label'] = df_chart_data.apply(
+                    lambda row: f"{row['Nome do agente']} - {row['Data'].strftime('%Y-%m-%d')} - Escala Planejada" if row['Tipo'] == 'Escala Planejada'
+                    else f"{row['Nome do agente']} - {row['Data'].strftime('%Y-%m-%d')} - Status Real",
+                    axis=1
+                )
+
                 # Ordenar para visualização
-                df_chart_data['Agente_Data_Tipo_Order'] = df_chart_data['Nome do agente'] + df_chart_data['Data'].astype(str) + df_chart_data['Tipo']
-                y_order = df_chart_data['Agente_Data_Tipo'].unique()
-                y_order = sorted(y_order, key=lambda x: (x.split(' - ')[0], x.split(' - ')[1].split(' ')[0], x.split('(')[1]))
+                # A ordem deve ser por agente, depois por data, e então 'Escala Planejada' antes de 'Status Real'
+                y_order_base = sorted(df_chart_data['Nome do agente'].unique())
+                y_order_final = []
+                for agent in y_order_base:
+                    dates_for_agent = sorted(df_chart_data[df_chart_data['Nome do agente'] == agent]['Data'].unique())
+                    for date in dates_for_agent:
+                        date_str = date.strftime('%Y-%m-%d')
+                        y_order_final.append(f"{agent} - {date_str} - Escala Planejada")
+                        y_order_final.append(f"{agent} - {date_str} - Status Real")
+
+                # Remover duplicatas e garantir que apenas labels existentes estejam na ordem
+                y_order_final = [label for label in y_order_final if label in df_chart_data['Y_Axis_Label'].unique()]
+                y_order_final = list(dict.fromkeys(y_order_final)) # Remove duplicatas mantendo a ordem
 
                 # Calcular altura do gráfico dinamicamente
-                num_unique_rows = len(df_chart_data['Agente_Data_Tipo'].unique())
+                num_unique_rows = len(df_chart_data['Y_Axis_Label'].unique())
                 chart_height = max(400, num_unique_rows * 30) # Ajuste a altura conforme necessário
 
                 fig = px.timeline(
                     df_chart_data,
                     x_start="Start",
                     x_end="Finish",
-                    y="Agente_Data_Tipo", # Usar a coluna combinada
+                    y="Y_Axis_Label", # Usar a nova coluna para o eixo Y
                     color="Tipo", # Colorir por tipo (Escala, Online, Away, Offline)
                     color_discrete_map={
                         'Escala Planejada': 'lightgray',
                         'Unified online': 'green',
                         'Unified away': 'orange',
                         'Unified offline': 'red',
-                        'Unified transfers only': 'purple'
+                        'Unified transfers only': 'purple',
+                        'Unified busy': 'blue', # Adicione outros estados se existirem
+                        'Unified not available': 'darkred'
                     },
                     title="Linha do Tempo de Status e Escala dos Agentes",
                     height=chart_height
                 )
 
-                fig.update_yaxes(categoryorder='array', categoryarray=y_order)
+                fig.update_yaxes(categoryorder='array', categoryarray=y_order_final)
                 fig.update_xaxes(
                     title_text="Hora do Dia",
                     tickformat="%H:%M",
-                    showgrid=True, # Mostrar grade no eixo X
+                    showgrid=True,
                     gridcolor='lightgray',
                     griddash='dot'
                 )
                 fig.update_yaxes(
-                    title_text="Agente - Data (Tipo)",
-                    showgrid=True, # Mostrar grade no eixo Y
+                    title_text="Agente - Data (Tipo de Registro)", # Título mais genérico
+                    showgrid=True,
                     gridcolor='lightgray',
                     griddash='dot'
                 )
-                fig.update_layout(hovermode="y unified") # Melhorar o hover
-
+                fig.update_layout(hovermode="x unified") # 'x unified' pode ser melhor para timeline
                 st.plotly_chart(fig, use_container_width=True)
 
                 st.subheader("Métricas de Disponibilidade na Escala")

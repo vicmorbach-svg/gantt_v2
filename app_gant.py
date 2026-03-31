@@ -448,7 +448,7 @@ with tab_visualization:
                         df_expanded_scale_chart = pd.DataFrame(expanded_scale_for_chart)
                         df_chart_data = pd.concat([df_chart_data, df_expanded_scale_chart[['Agente_Data_Tipo', 'Start', 'Finish', 'Tipo', 'Nome do agente', 'Data']]])
 
-                        if not df_chart_data.empty:
+            if not df_chart_data.empty:
                 # Criar uma coluna 'Y_Axis_Label' para controlar o agrupamento no eixo Y
                 df_chart_data['Y_Axis_Label'] = df_chart_data.apply(
                     lambda row: f"{row['Nome do agente']} - {row['Data'].strftime('%Y-%m-%d')} - Escala Planejada" if row['Tipo'] == 'Escala Planejada'

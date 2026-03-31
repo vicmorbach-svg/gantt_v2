@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, date # Importar date explicitamente
 import numpy as np
 import unicodedata
 
@@ -139,8 +139,8 @@ def process_uploaded_scale(df_scale_raw, start_effective_date, end_effective_dat
                     'Entrada': entrada,
                     'Saída': saida,
                     'Carga': carga,
-                    'Data Início Vigência': start_effective_date,
-                    'Data Fim Vigência': end_effective_date # Pode ser None para indefinido
+                    'Data Início Vigência': start_effective_date, # Armazena como date object
+                    'Data Fim Vigência': end_effective_date # Armazena como date object ou None
                 })
             else:
                 st.warning(f"Dia da semana '{dia_abbr}' não reconhecido para o agente {agent_name}. Ignorando.")
@@ -155,7 +155,8 @@ def process_uploaded_scale(df_scale_raw, start_effective_date, end_effective_dat
 # Função para obter a escala vigente para um agente em uma data específica
 def get_effective_scale_for_day(agent_name, current_date, df_escala_history):
     # Filtra escalas para o agente, dia da semana e onde current_date está dentro do período de vigência
-    # Data Fim Vigência pode ser None (indefinido)
+    # current_date é um date object
+    # As colunas 'Data Início Vigência' e 'Data Fim Vigência' agora armazenam date objects
     agent_scales = df_escala_history[
         (df_escala_history['Nome do agente'] == agent_name) &
         (df_escala_history['Dia da Semana Num'] == current_date.weekday()) &
@@ -258,14 +259,13 @@ st.title("Dashboard de Produtividade de Agentes")
 if 'df_real_status_history' not in st.session_state:
     st.session_state.df_real_status_history = pd.DataFrame()
 if 'df_escala_history' not in st.session_state:
-    # Inicializa com as colunas corretas para Data Início/Fim Vigência
+    # Inicializa com as colunas corretas. As colunas de data armazenarão date objects.
     st.session_state.df_escala_history = pd.DataFrame(columns=[
         'Nome do agente', 'Dia da Semana Num', 'Entrada', 'Saída', 'Carga',
         'Data Início Vigência', 'Data Fim Vigência'
     ])
-    # Garante que as colunas de data sejam do tipo datetime
-    st.session_state.df_escala_history['Data Início Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Início Vigência'])
-    st.session_state.df_escala_history['Data Fim Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Fim Vigência'])
+    # Não é necessário pd.to_datetime aqui, pois queremos armazenar date objects puros.
+    # O tipo será 'object' para essas colunas, o que é esperado para date objects.
 
 if 'all_unique_agents' not in st.session_state:
     st.session_state.all_unique_agents = set()
@@ -328,10 +328,10 @@ with tab_upload:
                 for index, new_row in new_df_escala.iterrows():
                     agent = new_row['Nome do agente']
                     day_num = new_row['Dia da Semana Num']
-                    new_start_date = new_row['Data Início Vigência']
-                    new_end_date = new_row['Data Fim Vigência']
+                    new_start_date = new_row['Data Início Vigência'] # É um date object
 
                     # Encontrar escalas existentes para o mesmo agente e dia da semana que se sobrepõem
+                    # A comparação agora é entre date objects
                     overlapping_scales_mask = (
                         (st.session_state.df_escala_history['Nome do agente'] == agent) &
                         (st.session_state.df_escala_history['Dia da Semana Num'] == day_num) &
@@ -367,6 +367,7 @@ with tab_upload:
                 st.warning("O arquivo de escala processado está vazio.")
         except Exception as e:
             st.error(f"Erro ao processar o arquivo de escala. Verifique o formato do arquivo. Erro: {e}")
+            st.exception(e) # Para ver o traceback completo
 
     # Atualizar a lista de agentes únicos APENAS da escala
     if not st.session_state.df_escala_history.empty and 'Nome do agente' in st.session_state.df_escala_history.columns:
@@ -393,8 +394,6 @@ with tab_upload:
             'Nome do agente', 'Dia da Semana Num', 'Entrada', 'Saída', 'Carga',
             'Data Início Vigência', 'Data Fim Vigência'
         ])
-        st.session_state.df_escala_history['Data Início Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Início Vigência'])
-        st.session_state.df_escala_history['Data Fim Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Fim Vigência'])
         st.session_state.all_unique_agents = set() # Limpa agentes também
         st.success("Histórico de Escalas limpo.")
         st.rerun()
@@ -455,8 +454,8 @@ with tab_manage_scales:
                         'Entrada': new_entry_time,
                         'Saída': new_exit_time,
                         'Carga': new_carga if new_carga else None,
-                        'Data Início Vigência': new_start_effective_date,
-                        'Data Fim Vigência': new_end_effective_date
+                        'Data Início Vigência': new_start_effective_date, # date object
+                        'Data Fim Vigência': new_end_effective_date # date object ou None
                     }
                     new_scale_df_row = pd.DataFrame([new_scale_entry])
 
@@ -540,7 +539,7 @@ with tab_visualization:
                 key="agent_multiselect"
             )
 
-        # Definir min_date_report e max_date_report com base nos dados disponíveis
+        # Definir min_date_data e max_date_data com base nos dados disponíveis
         min_date_data = datetime.now().date()
         max_date_data = datetime.now().date()
 
@@ -550,7 +549,7 @@ with tab_visualization:
 
         # Para a escala, a data mínima de vigência pode ser o limite inferior
         if not st.session_state.df_escala_history.empty and not st.session_state.df_escala_history['Data Início Vigência'].empty:
-            min_date_data = min(min_date_data, st.session_state.df_escala_history['Data Início Vigência'].min().date())
+            min_date_data = min(min_date_data, st.session_state.df_escala_history['Data Início Vigência'].min())
             # A data máxima de vigência da escala pode ser no futuro, não é um limite superior para o filtro de dados
             # max_date_data = max(max_date_data, st.session_state.df_escala_history['Data Fim Vigência'].max().date()) # Isso pode levar a datas muito futuras
 
@@ -621,8 +620,8 @@ with tab_visualization:
                 y_order_final = []
                 for agent in y_order_base:
                     dates_for_agent = sorted(df_chart_data[df_chart_data['Nome do agente'] == agent]['Data'].unique())
-                    for date in dates_for_agent:
-                        date_str = date.strftime('%Y-%m-%d')
+                    for date_obj in dates_for_agent: # Renomeado para evitar conflito com datetime.date
+                        date_str = date_obj.strftime('%Y-%m-%d')
                         # Garante que a Escala Planejada venha antes do Status Real para cada dia
                         if f"{agent} - {date_str} - Escala Planejada" in df_chart_data['Y_Axis_Label'].unique():
                             y_order_final.append(f"{agent} - {date_str} - Escala Planejada")

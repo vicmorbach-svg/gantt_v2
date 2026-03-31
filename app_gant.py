@@ -20,7 +20,7 @@ def process_uploaded_report(df_report_raw):
 
     expected_columns_report = {
         'Nome do agente': 'Nome do agente',
-        'Hora de início do estado - Dia do mês': 'Dia', # Esta coluna pode ser ignorada se usarmos o timestamp completo
+        'Hora de início do estado - Dia do mês': 'Dia',
         'Hora de início do estado - Carimbo de data/hora': 'Hora de início do estado - Carimbo de data/hora',
         'Hora de término do estado - Carimbo de data/hora': 'Hora de término do estado - Carimbo de data/hora',
         'Estado': 'Estado',
@@ -50,7 +50,6 @@ def process_uploaded_report(df_report_raw):
 
     # Ajuste na lógica de cálculo de métricas: se status_end for no dia seguinte ao status_start,
     # ajustar para o final do dia status_start para cálculo diário.
-    # Isso é importante para que cada registro de status seja considerado dentro do seu dia de início.
     df['Hora de término do estado - Carimbo de data/hora'] = df.apply(
         lambda row: row['Hora de início do estado - Carimbo de data/hora'].replace(hour=23, minute=59, second=59)
         if row['Hora de término do estado - Carimbo de data/hora'].date() > row['Hora de início do estado - Carimbo de data/hora'].date()
@@ -208,16 +207,17 @@ def calculate_metrics(df_real_status_history, df_escala_history, selected_agents
                     day_end_limit = datetime.combine(current_date_metrics, time.max)
                     effective_scale_end = min(scale_end_dt, day_end_limit)
 
+                    # Calcula o tempo total agendado para o dia dentro do limite do dia
                     if effective_scale_end > scale_start_dt:
                         total_scheduled_time_minutes += (effective_scale_end - scale_start_dt).total_seconds() / 60
 
                     # Status real para o agente no dia atual
-                    daily_real_status = agent_real_status[
+                    daily_online_status = agent_real_status[
                         (agent_real_status['Hora de início do estado - Carimbo de data/hora'].dt.date == current_date_metrics) &
                         (agent_real_status['Estado'] == 'Unified online')
                     ]
 
-                    for _, status_row in daily_real_status.iterrows():
+                    for _, status_row in daily_online_status.iterrows():
                         status_start = status_row['Hora de início do estado - Carimbo de data/hora']
                         status_end = status_row['Hora de término do estado - Carimbo de data/hora']
 
@@ -275,8 +275,8 @@ with tab_upload:
                 if st.session_state.df_real_status_history.empty:
                     st.session_state.df_real_status_history = new_df_real_status
                 else:
-                    # Cria uma chave única para cada linha para identificar duplicatas
                     cols_to_check = ['Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado']
+                    # Cria uma chave única para cada linha para identificar duplicatas
                     new_df_real_status['__key__'] = new_df_real_status[cols_to_check].astype(str).agg('_'.join, axis=1)
                     st.session_state.df_real_status_history['__key__'] = st.session_state.df_real_status_history[cols_to_check].astype(str).agg('_'.join, axis=1)
 
@@ -312,7 +312,6 @@ with tab_upload:
                 if st.session_state.df_escala_history.empty:
                     st.session_state.df_escala_history = new_df_escala
                 else:
-                    # Cria uma chave única para cada linha para identificar duplicatas
                     cols_to_check_scale = ['Nome do agente', 'Dia da Semana Num', 'Entrada', 'Saída', 'Data de Vigência']
                     new_df_escala['__key__'] = new_df_escala[cols_to_check_scale].astype(str).agg('_'.join, axis=1)
                     st.session_state.df_escala_history['__key__'] = st.session_state.df_escala_history[cols_to_check_scale].astype(str).agg('_'.join, axis=1)
@@ -483,8 +482,19 @@ with tab_visualization:
                 key="agent_multiselect"
             )
 
-        min_date_report = st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'].min().date() if not st.session_state.df_real_status_history.empty else datetime.now().date()
-        max_date_report = st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'].max().date() if not st.session_state.df_real_status_history.empty else datetime.now().date()
+        # Definir min_date_report e max_date_report com base nos dados disponíveis
+        min_date_report = datetime.now().date()
+        max_date_report = datetime.now().date()
+
+        if not st.session_state.df_real_status_history.empty:
+            min_date_report = min(min_date_report, st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'].min().date())
+            max_date_report = max(max_date_report, st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'].max().date())
+
+        if not st.session_state.df_escala_history.empty:
+            min_date_report = min(min_date_report, st.session_state.df_escala_history['Data de Vigência'].min())
+            # A data máxima da escala pode ser o futuro, então não usamos para max_date_report diretamente
+            # max_date_report = max(max_date_report, st.session_state.df_escala_history['Data de Vigência'].max())
+
 
         start_date = st.date_input("Data de Início", value=min_date_report, min_value=min_date_report, max_value=max_date_report)
         end_date = st.date_input("Data de Fim", value=max_date_report, min_value=min_date_report, max_value=max_date_report)
@@ -580,7 +590,7 @@ with tab_visualization:
                         'Unified transfers only': 'purple',
                         'Unified busy': 'blue',
                         'Unified not available': 'darkred',
-                        'Unified wrap up': 'brown' # Adicione outros estados se existirem
+                        'Unified wrap up': 'brown'
                     },
                     title="Linha do Tempo de Status e Escala dos Agentes",
                     height=chart_height

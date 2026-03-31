@@ -139,8 +139,8 @@ def process_uploaded_scale(df_scale_raw, start_effective_date, end_effective_dat
                     'Entrada': entrada,
                     'Saída': saida,
                     'Carga': carga,
-                    'Data Início Vigência': start_effective_date, # Armazena como date object
-                    'Data Fim Vigência': end_effective_date # Armazena como date object ou None
+                    'Data Início Vigência': pd.Timestamp(start_effective_date), # Convert to Timestamp
+                    'Data Fim Vigência': pd.Timestamp(end_effective_date) if end_effective_date else pd.NaT # Convert to Timestamp or NaT
                 })
             else:
                 st.warning(f"Dia da semana '{dia_abbr}' não reconhecido para o agente {agent_name}. Ignorando.")
@@ -150,26 +150,21 @@ def process_uploaded_scale(df_scale_raw, start_effective_date, end_effective_dat
         st.warning("Nenhuma escala válida foi encontrada após o processamento. Verifique a coluna 'DIAS DE ATENDIMENTO'.")
         return pd.DataFrame()
 
-    # Converter as colunas de vigência para datetime64[ns] após a criação do DataFrame
-    # Isso garante que .dt.date funcione, e NaT será o valor para None
-    df_escala_expanded['Data Início Vigência'] = pd.to_datetime(df_escala_expanded['Data Início Vigência'])
-    df_escala_expanded['Data Fim Vigência'] = pd.to_datetime(df_escala_expanded['Data Fim Vigência'])
-
     return df_escala_expanded
 
 # Função para obter a escala vigente para um agente em uma data específica
 def get_effective_scale_for_day(agent_name, current_date, df_escala_history):
-    # current_date é um date object
-    # As colunas 'Data Início Vigência' e 'Data Fim Vigência' são datetime64[ns] (com NaT para indefinido)
+    # current_date é um date object, convertemos para Timestamp para comparação consistente
+    current_date_ts = pd.Timestamp(current_date)
 
     # Filtra escalas para o agente, dia da semana e onde current_date está dentro do período de vigência
     agent_scales = df_escala_history[
         (df_escala_history['Nome do agente'] == agent_name) &
         (df_escala_history['Dia da Semana Num'] == current_date.weekday()) &
-        (df_escala_history['Data Início Vigência'].dt.date <= current_date) &
+        (df_escala_history['Data Início Vigência'] <= current_date_ts) & # Comparação com Timestamp
         (
             (df_escala_history['Data Fim Vigência'].isna()) | # Se Data Fim Vigência é NaT (indefinido)
-            (df_escala_history['Data Fim Vigência'].dt.date >= current_date) # OU a data de fim é maior ou igual à current_date
+            (df_escala_history['Data Fim Vigência'] >= current_date_ts) # OU a data de fim é maior ou igual à current_date_ts
         )
     ].copy()
 
@@ -178,8 +173,8 @@ def get_effective_scale_for_day(agent_name, current_date, df_escala_history):
 
     # Se houver múltiplas escalas válidas, pega a que começou mais recentemente
     # Isso resolve o caso de uma escala ser substituída por outra
-    latest_start_date = agent_scales['Data Início Vigência'].dt.date.max()
-    return agent_scales[agent_scales['Data Início Vigência'].dt.date == latest_start_date]
+    latest_start_date = agent_scales['Data Início Vigência'].max()
+    return agent_scales[agent_scales['Data Início Vigência'] == latest_start_date]
 
 def calculate_metrics(df_real_status_history, df_escala_history, selected_agents, start_date, end_date):
     analysis_results = []
@@ -217,60 +212,52 @@ def calculate_metrics(df_real_status_history, df_escala_history, selected_agents
                     if scale_end_dt < scale_start_dt:
                         scale_end_dt += timedelta(days=1)
 
-                    # Garante que a escala não exceda o dia atual para o cálculo
-                    day_end_limit = datetime.combine(current_date_metrics, time.max)
-                    effective_scale_end = min(scale_end_dt, day_end_limit)
+                    # Tempo total agendado para o dia
+                    total_scheduled_time_minutes += (scale_end_dt - scale_start_dt).total_seconds() / 60
 
-                    # Calcula o tempo total agendado para o dia dentro do limite do dia
-                    if effective_scale_end > scale_start_dt:
-                        total_scheduled_time_minutes += (effective_scale_end - scale_start_dt).total_seconds() / 60
-
-                    # Status real para o agente no dia atual
-                    daily_online_status = agent_real_status[
-                        (agent_real_status['Hora de início do estado - Carimbo de data/hora'].dt.date == current_date_metrics) &
-                        (agent_real_status['Estado'] == 'Unified online')
+                    # Calcular tempo online dentro da escala
+                    agent_status_on_day = agent_real_status[
+                        (agent_real_status['Hora de início do estado - Carimbo de data/hora'].dt.date == current_date_metrics)
                     ]
 
-                    for _, status_row in daily_online_status.iterrows():
+                    for _, status_row in agent_status_on_day.iterrows():
                         status_start = status_row['Hora de início do estado - Carimbo de data/hora']
                         status_end = status_row['Hora de término do estado - Carimbo de data/hora']
+                        status_type = status_row['Estado']
 
-                        # Garante que o status não exceda o dia atual para o cálculo
-                        effective_status_end = min(status_end, day_end_limit)
+                        # Considerar apenas estados "online" para disponibilidade
+                        if status_type in ['Unified online', 'Unified transfers only', 'Unified busy', 'Unified wrap up']:
+                            # Interseção do período de status com o período de escala
+                            overlap_start = max(scale_start_dt, status_start)
+                            overlap_end = min(scale_end_dt, status_end)
 
-                        # Calcular interseção entre o status online e a escala
-                        overlap_start = max(scale_start_dt, status_start)
-                        overlap_end = min(effective_scale_end, effective_status_end)
+                            if overlap_end > overlap_start:
+                                total_online_in_schedule_minutes += (overlap_end - overlap_start).total_seconds() / 60
 
-                        if overlap_end > overlap_start:
-                            total_online_in_schedule_minutes += (overlap_end - overlap_start).total_seconds() / 60
             current_date_metrics += timedelta(days=1)
 
         availability_percentage = (total_online_in_schedule_minutes / total_scheduled_time_minutes * 100) if total_scheduled_time_minutes > 0 else 0
 
         analysis_results.append({
             'Agente': agent,
-            'Total Tempo Escala (min)': total_scheduled_time_minutes,
-            'Total Tempo Online na Escala (min)': total_online_in_schedule_minutes,
-            'Disponibilidade na Escala (%)': f"{availability_percentage:.2f}%"
+            'Período': f"{start_date.strftime('%Y-%m-%d')} a {end_date.strftime('%Y-%m-%d')}",
+            'Tempo Agendado (min)': round(total_scheduled_time_minutes, 2),
+            'Tempo Online na Escala (min)': round(total_online_in_schedule_minutes, 2),
+            'Disponibilidade (%)': round(availability_percentage, 2)
         })
+
     return pd.DataFrame(analysis_results)
 
-# --- Configuração da Página Streamlit ---
-st.set_page_config(layout="wide", page_title="Dashboard de Produtividade de Agentes")
+# --- Inicialização do Streamlit ---
+st.set_page_config(layout="wide", page_title="Análise de Produtividade de Agentes")
 
-st.title("Dashboard de Produtividade de Agentes")
-
-# --- Inicialização do Session State para Histórico ---
+# Inicializa session_state
 if 'df_real_status_history' not in st.session_state:
     st.session_state.df_real_status_history = pd.DataFrame(columns=[
         'Nome do agente', 'Hora de início do estado - Carimbo de data/hora',
         'Hora de término do estado - Carimbo de data/hora', 'Estado',
         'Tempo do agente no estado / Minutos'
     ])
-    st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'] = pd.to_datetime(st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'])
-    st.session_state.df_real_status_history['Hora de término do estado - Carimbo de data/hora'] = pd.to_datetime(st.session_state.df_real_status_history['Hora de término do estado - Carimbo de data/hora'])
-
 if 'df_escala_history' not in st.session_state:
     st.session_state.df_escala_history = pd.DataFrame(columns=[
         'Nome do agente', 'Dia da Semana Num', 'Entrada', 'Saída', 'Carga',
@@ -282,210 +269,193 @@ if 'df_escala_history' not in st.session_state:
 
 if 'all_unique_agents' not in st.session_state:
     st.session_state.all_unique_agents = set()
-
 if 'agent_groups' not in st.session_state:
     st.session_state.agent_groups = {}
 
-# --- Abas ---
+st.title("Dashboard de Produtividade de Agentes")
+
 tab_upload, tab_manage_scales, tab_groups, tab_visualization = st.tabs([
     "Upload de Dados", "Gerenciar Escalas", "Gerenciar Grupos", "Visualização e Métricas"
 ])
 
 with tab_upload:
-    st.header("Upload de Arquivos de Dados")
+    st.header("Upload de Arquivos")
 
     st.subheader("Upload de Relatório de Status Real")
-    uploaded_report_file = st.file_uploader("Escolha um arquivo Excel (.xlsx) para o relatório de status real", type=["xlsx"], key="report_uploader")
-    if uploaded_report_file:
-        try:
-            df_report_raw = pd.read_excel(uploaded_report_file)
-            df_processed_report = process_uploaded_report(df_report_raw)
+    uploaded_file_report = st.file_uploader("Escolha um arquivo Excel (.xlsx) para o relatório de status", type=["xlsx"], key="report_uploader")
+    if uploaded_file_report:
+        df_report_raw = pd.read_excel(uploaded_file_report)
+        df_processed_report = process_uploaded_report(df_report_raw)
 
-            if not df_processed_report.empty:
-                # Remover duplicatas antes de adicionar ao histórico
-                # Considera 'Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado' como chaves únicas
-                df_processed_report_unique = df_processed_report.drop_duplicates(subset=[
-                    'Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado'
-                ])
+        if not df_processed_report.empty:
+            # Remover duplicatas antes de adicionar ao histórico
+            # Considera Nome do agente, Hora de início, Estado como identificadores únicos para um status
+            df_processed_report_unique = df_processed_report.drop_duplicates(subset=[
+                'Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado'
+            ])
 
-                # Anexar ao histórico, evitando duplicatas com base nas chaves acima
-                if not st.session_state.df_real_status_history.empty:
-                    combined_df = pd.concat([st.session_state.df_real_status_history, df_processed_report_unique], ignore_index=True)
-                    st.session_state.df_real_status_history = combined_df.drop_duplicates(subset=[
-                        'Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado'
-                    ]).reset_index(drop=True)
-                else:
-                    st.session_state.df_real_status_history = df_processed_report_unique.reset_index(drop=True)
+            # Adicionar apenas novos registros ao histórico
+            # Isso é um pouco complexo, uma abordagem mais simples é concatenar e depois dropar duplicatas no histórico total
+            st.session_state.df_real_status_history = pd.concat([st.session_state.df_real_status_history, df_processed_report_unique], ignore_index=True)
+            st.session_state.df_real_status_history.drop_duplicates(subset=[
+                'Nome do agente', 'Hora de início do estado - Carimbo de data/hora', 'Estado'
+            ], inplace=True)
+            st.session_state.df_real_status_history.reset_index(drop=True, inplace=True)
 
-                st.success("Relatório de status real processado e adicionado ao histórico com sucesso!")
-                st.write(f"Total de registros de status real no histórico: {len(st.session_state.df_real_status_history)}")
-                st.dataframe(st.session_state.df_real_status_history.head())
-            else:
-                st.error("Nenhum dado válido encontrado no relatório de status real após o processamento.")
-        except Exception as e:
-            st.error(f"Erro ao processar o arquivo de relatório de status real. Verifique o formato do arquivo. Erro: {e}")
+            st.success("Relatório de status real processado e adicionado ao histórico!")
+            st.dataframe(df_processed_report_unique.head())
+        else:
+            st.error("Falha ao processar o relatório de status real. Verifique o formato do arquivo.")
 
     st.subheader("Upload de Arquivo de Escala")
-    uploaded_scale_file = st.file_uploader("Escolha um arquivo Excel (.xlsx) para a escala", type=["xlsx"], key="scale_uploader")
-    if uploaded_scale_file:
+    uploaded_file_scale = st.file_uploader("Escolha um arquivo Excel (.xlsx) para a escala", type=["xlsx"], key="scale_uploader")
+    if uploaded_file_scale:
         st.info("Para o arquivo de escala, você precisa definir a data de início e, opcionalmente, a data de fim de vigência.")
-        new_start_effective_date = st.date_input("Data de Início da Vigência da Escala", value=datetime.now().date(), key="scale_start_date_upload")
-        new_end_effective_date = st.date_input("Data de Fim da Vigência da Escala (opcional)", value=None, key="scale_end_date_upload")
+        new_start_effective_date = st.date_input("Data de Início de Vigência para esta escala:", value=datetime.now().date(), key="scale_start_date_input")
+        new_end_effective_date = st.date_input("Data de Fim de Vigência para esta escala (opcional):", value=None, key="scale_end_date_input")
 
         if st.button("Processar e Adicionar Escala"):
-            try:
-                df_scale_raw = pd.read_excel(uploaded_scale_file)
-                df_processed_scale = process_uploaded_scale(df_scale_raw, new_start_effective_date, new_end_effective_date)
+            df_scale_raw = pd.read_excel(uploaded_file_scale)
+            df_processed_scale = process_uploaded_scale(df_scale_raw, new_start_effective_date, new_end_effective_date)
 
-                if not df_processed_scale.empty:
-                    # Lógica para ajustar a Data Fim Vigência de escalas antigas que se sobrepõem
-                    # Para cada nova entrada de escala, verificar se há escalas antigas para o mesmo agente/dia da semana
-                    # que terminam depois da nova data de início de vigência.
+            if not df_processed_scale.empty:
+                # Lógica para atualizar escalas existentes:
+                # Para cada linha na nova escala, verifica se há escalas antigas que se sobrepõem
+                # e ajusta a Data Fim Vigência das escalas antigas.
+                df_escala_history_copy = st.session_state.df_escala_history.copy()
 
-                    # Criar uma cópia para iterar e modificar o original
-                    df_escala_history_copy = st.session_state.df_escala_history.copy()
+                for _, new_scale_row in df_processed_scale.iterrows():
+                    agent = new_scale_row['Nome do agente']
+                    day_num = new_scale_row['Dia da Semana Num']
+                    new_start = new_scale_row['Data Início Vigência'] # Já é Timestamp
+                    new_end = new_scale_row['Data Fim Vigência'] # Já é Timestamp ou NaT
 
-                    for _, new_row in df_processed_scale.iterrows():
-                        agent = new_row['Nome do agente']
-                        day_num = new_row['Dia da Semana Num']
-                        new_start = new_row['Data Início Vigência'].date() # Apenas a data para comparação
-
-                        # Encontrar escalas existentes que seriam substituídas/encerradas pela nova escala
-                        overlapping_scales_mask = (
-                            (df_escala_history_copy['Nome do agente'] == agent) &
-                            (df_escala_history_copy['Dia da Semana Num'] == day_num) &
-                            (df_escala_history_copy['Data Início Vigência'].dt.date < new_start) & # Começou antes da nova
-                            (
-                                (df_escala_history_copy['Data Fim Vigência'].isna()) | # E ainda está ativa
-                                (df_escala_history_copy['Data Fim Vigência'].dt.date >= new_start) # Ou termina depois/no mesmo dia da nova
-                            )
+                    # Encontra escalas antigas para o mesmo agente e dia da semana que se sobrepõem
+                    # e cuja data de início é anterior à nova data de início
+                    overlapping_old_scales_idx = df_escala_history_copy[
+                        (df_escala_history_copy['Nome do agente'] == agent) &
+                        (df_escala_history_copy['Dia da Semana Num'] == day_num) &
+                        (df_escala_history_copy['Data Início Vigência'] < new_start) & # Comparação Timestamp com Timestamp
+                        (
+                            (df_escala_history_copy['Data Fim Vigência'].isna()) | # Se a antiga é indefinida
+                            (df_escala_history_copy['Data Fim Vigência'] >= new_start) # Ou termina depois/no mesmo dia da nova
                         )
+                    ].index
 
-                        # Ajustar a Data Fim Vigência das escalas antigas para o dia anterior à nova escala
-                        # Usar .loc para evitar SettingWithCopyWarning
-                        st.session_state.df_escala_history.loc[overlapping_scales_mask, 'Data Fim Vigência'] = pd.to_datetime(new_start - timedelta(days=1))
+                    # Ajusta a Data Fim Vigência das escalas antigas
+                    if not overlapping_old_scales_idx.empty:
+                        df_escala_history_copy.loc[overlapping_old_scales_idx, 'Data Fim Vigência'] = new_start - timedelta(days=1)
 
-                    # Anexar as novas escalas
-                    st.session_state.df_escala_history = pd.concat([st.session_state.df_escala_history, df_processed_scale], ignore_index=True)
+                # Adiciona a nova escala ao histórico
+                st.session_state.df_escala_history = pd.concat([df_escala_history_copy, df_processed_scale], ignore_index=True)
 
-                    # Atualizar a lista de agentes únicos a partir da escala
-                    st.session_state.all_unique_agents.update(df_processed_scale['Nome do agente'].unique())
+                # Atualiza a lista de agentes únicos a partir da escala
+                st.session_state.all_unique_agents.update(df_processed_scale['Nome do agente'].unique())
 
-                    st.success("Arquivo de escala processado e adicionado ao histórico com sucesso!")
-                    st.write(f"Total de registros de escala no histórico: {len(st.session_state.df_escala_history)}")
-                    st.dataframe(st.session_state.df_escala_history.head())
-                else:
-                    st.error("Nenhum dado válido encontrado no arquivo de escala após o processamento.")
-            except Exception as e:
-                st.error(f"Erro ao processar o arquivo de escala. Verifique o formato do arquivo. Erro: {e}")
-                st.exception(e) # Exibe o traceback completo para depuração
+                st.success("Arquivo de escala processado e adicionado ao histórico!")
+                st.dataframe(df_processed_scale.head())
+            else:
+                st.error("Falha ao processar o arquivo de escala. Verifique o formato do arquivo.")
 
-    st.subheader("Gerenciamento de Histórico")
-    if st.button("Limpar Histórico de Status Real"):
+    st.subheader("Dados Atuais no Histórico")
+    if not st.session_state.df_real_status_history.empty:
+        st.write("Últimos registros de Status Real:")
+        st.dataframe(st.session_state.df_real_status_history.tail())
+    if not st.session_state.df_escala_history.empty:
+        st.write("Últimos registros de Escala:")
+        st.dataframe(st.session_state.df_escala_history.tail())
+
+    if st.button("Limpar todo o Histórico de Dados (Status e Escala)"):
         st.session_state.df_real_status_history = pd.DataFrame(columns=[
             'Nome do agente', 'Hora de início do estado - Carimbo de data/hora',
             'Hora de término do estado - Carimbo de data/hora', 'Estado',
             'Tempo do agente no estado / Minutos'
         ])
-        st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'] = pd.to_datetime(st.session_state.df_real_status_history['Hora de início do estado - Carimbo de data/hora'])
-        st.session_state.df_real_status_history['Hora de término do estado - Carimbo de data/hora'] = pd.to_datetime(st.session_state.df_real_status_history['Hora de término do estado - Carimbo de data/hora'])
-        st.success("Histórico de status real limpo.")
-        st.rerun()
-
-    if st.button("Limpar Histórico de Escala"):
         st.session_state.df_escala_history = pd.DataFrame(columns=[
             'Nome do agente', 'Dia da Semana Num', 'Entrada', 'Saída', 'Carga',
             'Data Início Vigência', 'Data Fim Vigência'
         ])
         st.session_state.df_escala_history['Data Início Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Início Vigência'])
         st.session_state.df_escala_history['Data Fim Vigência'] = pd.to_datetime(st.session_state.df_escala_history['Data Fim Vigência'])
-        st.session_state.all_unique_agents = set() # Limpa agentes únicos também
-        st.success("Histórico de escala limpo.")
+        st.session_state.all_unique_agents = set()
+        st.session_state.agent_groups = {}
+        st.success("Histórico de dados limpo com sucesso!")
         st.rerun()
 
 with tab_manage_scales:
     st.header("Gerenciar Escalas Individualmente")
-
     if st.session_state.all_unique_agents:
         selected_agent_for_scale = st.selectbox(
             "Selecione o agente para gerenciar a escala:",
-            options=sorted(list(st.session_state.all_unique_agents)),
-            key="manage_scale_agent_selector"
+            options=[""] + sorted(list(st.session_state.all_unique_agents)),
+            key="manage_scale_agent_select"
         )
 
-        st.subheader(f"Escalas existentes para {selected_agent_for_scale}")
-        agent_current_scales = st.session_state.df_escala_history[
-            st.session_state.df_escala_history['Nome do agente'] == selected_agent_for_scale
-        ].sort_values(by=['Dia da Semana Num', 'Data Início Vigência'])
+        if selected_agent_for_scale:
+            st.subheader(f"Escalas para {selected_agent_for_scale}")
+            agent_scales_df = st.session_state.df_escala_history[
+                st.session_state.df_escala_history['Nome do agente'] == selected_agent_for_scale
+            ].sort_values(by=['Dia da Semana Num', 'Data Início Vigência'])
 
-        if not agent_current_scales.empty:
-            st.dataframe(agent_current_scales.style.format({
-                'Entrada': lambda t: t.strftime('%H:%M') if t else '',
-                'Saída': lambda t: t.strftime('%H:%M') if t else '',
-                'Data Início Vigência': '{:%Y-%m-%d}'.format,
-                'Data Fim Vigência': lambda d: '{:%Y-%m-%d}'.format(d) if pd.notna(d) else 'Indefinido'
-            }), use_container_width=True)
-        else:
-            st.info(f"Nenhuma escala encontrada para {selected_agent_for_scale}.")
+            if not agent_scales_df.empty:
+                st.dataframe(agent_scales_df.style.format({
+                    'Entrada': lambda t: t.strftime('%H:%M') if t else '',
+                    'Saída': lambda t: t.strftime('%H:%M') if t else '',
+                    'Data Início Vigência': '{:%Y-%m-%d}'.format,
+                    'Data Fim Vigência': lambda d: '{:%Y-%m-%d}'.format(d) if pd.notna(d) else 'Indefinido'
+                }), use_container_width=True)
+            else:
+                st.info("Nenhuma escala definida para este agente.")
 
-        st.subheader(f"Adicionar/Atualizar Escala para {selected_agent_for_scale}")
+            st.subheader("Adicionar/Atualizar Escala")
+            col1, col2 = st.columns(2)
+            with col1:
+                new_day_of_week = st.selectbox("Dia da Semana:", options=["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"])
+                new_entrada = st.time_input("Hora de Entrada:", value=time(9, 0))
+                new_start_effective_date = st.date_input("Data de Início de Vigência:", value=datetime.now().date())
+            with col2:
+                new_saida = st.time_input("Hora de Saída:", value=time(18, 0))
+                new_carga = st.text_input("Carga (opcional):", value="")
+                new_end_effective_date = st.date_input("Data de Fim de Vigência (opcional):", value=None)
 
-        days_of_week_map = {
-            "Segunda-feira": 0, "Terça-feira": 1, "Quarta-feira": 2,
-            "Quinta-feira": 3, "Sexta-feira": 4, "Sábado": 5, "Domingo": 6
-        }
-        new_day_of_week = st.selectbox("Dia da Semana", options=list(days_of_week_map.keys()))
-        new_day_of_week_num = days_of_week_map[new_day_of_week]
+            if st.button("Salvar Escala"):
+                if new_entrada and new_saida and selected_agent_for_scale and new_day_of_week and new_start_effective_date:
+                    day_num_map = {"Segunda":0, "Terça":1, "Quarta":2, "Quinta":3, "Sexta":4, "Sábado":5, "Domingo":6}
+                    selected_day_num = day_num_map[new_day_of_week]
 
-        col1, col2 = st.columns(2)
-        with col1:
-            new_entry_time_str = st.text_input("Hora de Entrada (HH:MM)", value="09:00")
-        with col2:
-            new_exit_time_str = st.text_input("Hora de Saída (HH:MM)", value="18:00")
+                    # Convertendo datas para Timestamp para consistência
+                    new_start_ts = pd.Timestamp(new_start_effective_date)
+                    new_end_ts = pd.Timestamp(new_end_effective_date) if new_end_effective_date else pd.NaT
 
-        try:
-            new_entry_time = datetime.strptime(new_entry_time_str, '%H:%M').time()
-            new_exit_time = datetime.strptime(new_exit_time_str, '%H:%M').time()
-        except ValueError:
-            st.error("Formato de hora inválido. Use HH:MM.")
-            new_entry_time = None
-            new_exit_time = None
+                    # Lógica para atualizar escalas existentes:
+                    df_escala_history_copy = st.session_state.df_escala_history.copy()
 
-        new_carga = st.text_input("Carga Horária (opcional)")
-
-        new_start_effective_date = st.date_input("Data de Início da Vigência", value=datetime.now().date(), key="manual_scale_start_date")
-        new_end_effective_date = st.date_input("Data de Fim da Vigência (opcional)", value=None, key="manual_scale_end_date")
-
-        if st.button("Salvar Alteração de Escala"):
-            if new_entry_time and new_exit_time and selected_agent_for_scale:
-                if new_end_effective_date and new_end_effective_date < new_start_effective_date:
-                    st.error("A Data de Fim da Vigência não pode ser anterior à Data de Início da Vigência.")
-                else:
-                    new_scale_entry = {
-                        'Nome do agente': selected_agent_for_scale,
-                        'Dia da Semana Num': new_day_of_week_num,
-                        'Entrada': new_entry_time,
-                        'Saída': new_exit_time,
-                        'Carga': new_carga if new_carga else None,
-                        'Data Início Vigência': pd.to_datetime(new_start_effective_date), # Converter para datetime64[ns]
-                        'Data Fim Vigência': pd.to_datetime(new_end_effective_date) if new_end_effective_date else pd.NaT # Converter para datetime64[ns] ou NaT
-                    }
-                    new_scale_df_row = pd.DataFrame([new_scale_entry])
-
-                    # Lógica para ajustar a Data Fim Vigência de escalas antigas
-                    overlapping_scales_mask = (
-                        (st.session_state.df_escala_history['Nome do agente'] == selected_agent_for_scale) &
-                        (st.session_state.df_escala_history['Dia da Semana Num'] == new_day_of_week_num) &
-                        (st.session_state.df_escala_history['Data Início Vigência'].dt.date < new_start_effective_date) &
+                    # Encontra escalas antigas para o mesmo agente e dia da semana que se sobrepõem
+                    # e cuja data de início é anterior à nova data de início
+                    overlapping_old_scales_idx = df_escala_history_copy[
+                        (df_escala_history_copy['Nome do agente'] == selected_agent_for_scale) &
+                        (df_escala_history_copy['Dia da Semana Num'] == selected_day_num) &
+                        (df_escala_history_copy['Data Início Vigência'] < new_start_ts) & # Comparação Timestamp com Timestamp
                         (
-                            (st.session_state.df_escala_history['Data Fim Vigência'].isna()) |
-                            (st.session_state.df_escala_history['Data Fim Vigência'].dt.date >= new_start_effective_date)
+                            (df_escala_history_copy['Data Fim Vigência'].isna()) | # Se a antiga é indefinida
+                            (df_escala_history_copy['Data Fim Vigência'] >= new_start_ts) # Ou termina depois/no mesmo dia da nova
                         )
-                    )
-                    st.session_state.df_escala_history.loc[overlapping_scales_mask, 'Data Fim Vigência'] = pd.to_datetime(new_start_effective_date - timedelta(days=1))
+                    ].index
 
-                    # Adicionar a nova escala
-                    st.session_state.df_escala_history = pd.concat([st.session_state.df_escala_history, new_scale_df_row], ignore_index=True)
+                    # Ajusta a Data Fim Vigência das escalas antigas
+                    if not overlapping_old_scales_idx.empty:
+                        df_escala_history_copy.loc[overlapping_old_scales_idx, 'Data Fim Vigência'] = new_start_ts - timedelta(days=1)
+
+                    new_scale_df_row = pd.DataFrame([{
+                        'Nome do agente': selected_agent_for_scale,
+                        'Dia da Semana Num': selected_day_num,
+                        'Entrada': new_entrada,
+                        'Saída': new_saida,
+                        'Carga': new_carga,
+                        'Data Início Vigência': new_start_ts,
+                        'Data Fim Vigência': new_end_ts
+                    }])
+                    st.session_state.df_escala_history = pd.concat([df_escala_history_copy, new_scale_df_row], ignore_index=True)
                     st.success(f"Escala para {selected_agent_for_scale} no(a) {new_day_of_week} com vigência de {new_start_effective_date} a {new_end_effective_date if new_end_effective_date else 'indefinido'} salva com sucesso!")
                     st.rerun()
             else:

@@ -179,7 +179,7 @@ def process_uploaded_scale(df_scale_raw, start_effective_date, end_effective_dat
     df = df_scale_raw.copy()
 
     expected_columns_scale = {
-        'Nome do agente': 'Nome do agente',
+        'Nome': 'Nome do agente',
         'Dias de Atendimento': 'Dias de Atendimento',
         'Entrada': 'Entrada',
         'Saída': 'Saída'
